@@ -4044,19 +4044,6 @@ void ManagePositions()
       double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;
       double rMult =(dir==1?(mkt-openP):(openP-mkt))/risk;
 
-      //--- SAFETY NET: a position must NEVER run without a stop. If the SL is missing (0) for any
-      //  reason (e.g. a broker dropping SL/TP on a partial close), immediately re-apply a protective
-      //  stop — the break-even level if we've already locked, else the original structure stop. ---
-      if(curSL==0.0){
-         double wantSL=(mi>=0 && gMgBEDone[mi])
-                       ? NormPrice(openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point))
-                       : initSL;
-         if(wantSL>0.0 && ((dir==1&&wantSL<mkt)||(dir==-1&&wantSL>mkt))){
-            if(trade.PositionModify(tk,wantSL,0.0)){ DbgMod("SAFETY re-apply SL (was missing)",tk,dir,0.0,wantSL,mkt); curSL=wantSL; }
-            else if(MktClosed()) return;
-         }
-      }
-
       //==================================================================
       // ACCOUNT PROFIT GUARD (equity-protection overlay, runs BEFORE the hold gate)
       //==================================================================
@@ -4073,16 +4060,13 @@ void ManagePositions()
          double origVol=(gMgOrigVol[mi]>0.0 ? gMgOrigVol[mi] : PositionGetDouble(POSITION_VOLUME));
          double curVol =PositionGetDouble(POSITION_VOLUME);
          int    tier   =gMgPGTier[mi];
-         //--- Tier 1: 40% off FIRST, then (re)apply break-even on the remaining volume ---
-         //  Order matters: some brokers drop SL/TP from the remaining position on a partial close,
-         //  so we re-read POSITION_SL AFTER the partial and re-assert the break-even stop. ---
+         //--- Tier 1: break-even + 40% off ---
          if(tier<1 && gainPct>=InpPG_Tier1Pct){
+            double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
+            bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
+            if(improve){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,curSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
             if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier1Close))
                DbgExit("PG T1 scale-out ("+DoubleToString(InpPG_Tier1Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
-            double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
-            double nowSL=PositionGetDouble(POSITION_SL);                 // re-read: the partial may have changed/dropped it
-            bool improve=(dir==1?(be>nowSL):(nowSL==0||be<nowSL));
-            if(improve){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,nowSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
             gMgPGTier[mi]=1; gMgBEDone[mi]=true;
             continue;   // re-evaluate next tick with the new volume/SL
          }
@@ -4100,17 +4084,13 @@ void ManagePositions()
          }
          //--- ATR trailing once Tier 2+ is active (defends the locked profit, leaves the runner room) ---
          if(gMgPGTier[mi]>=2){
-            double liveSL=PositionGetDouble(POSITION_SL);                // re-read: a Tier2/3 partial may have dropped it
             double dist=atr*InpPG_TrailAtrMult; double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
             double newSL=(dir==1? mkt-dist : mkt+dist); newSL=NormPrice(newSL);
-            //  never trail to the losing side of entry
-            if(dir==1 && newSL<openP) newSL=NormPrice(openP+InpPG_BEOffsetPoints*_Point);
-            if(dir==-1&& newSL>openP) newSL=NormPrice(openP-InpPG_BEOffsetPoints*_Point);
-            //  apply if it improves OR if the live stop went missing (re-assert protection)
-            bool tImprove=(liveSL==0.0) || (dir==1?(newSL>liveSL):(newSL<liveSL));
-            if(tImprove && ((dir==1&&newSL<mkt)||(dir==-1&&newSL>mkt))){
-               if(trade.PositionModify(tk,newSL,0.0)){ DbgMod("PG trail",tk,dir,liveSL,newSL,mkt); curSL=newSL; } else if(MktClosed()) return;
-            }
+            bool tImprove=(dir==1?(newSL>curSL):(curSL==0||newSL<curSL));
+            // never trail to the losing side of entry
+            if(dir==1 && newSL<openP) tImprove=false;
+            if(dir==-1&& newSL>openP) tImprove=false;
+            if(tImprove){ if(trade.PositionModify(tk,newSL,0.0)){ DbgMod("PG trail",tk,dir,curSL,newSL,mkt); curSL=newSL; } else if(MktClosed()) return; }
          }
       }
 
