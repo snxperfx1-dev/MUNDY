@@ -3161,7 +3161,7 @@ input int           InpSessStartHour    = 7;            // Session start hour
 input int           InpSessEndHour      = 20;           // Session end hour
 input bool          InpSkipFriday       = false;        // No new trades on Friday
 input bool          InpCloseAtSessEnd   = false;        // Close all at session end
-input double        InpMaxDailyLossPct  = 5.0;          // Halt after daily loss % (0=off)
+input double        InpMaxDailyLossPct  = 0.0;          // Halt after daily loss % (0=OFF - daily-loss limit removed per request)
 input int           InpMaxTradesPerDay  = 20;           // Max new trades per day (0=off)
 
 input group "Letra37 EA - Misc"
