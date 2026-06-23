@@ -3662,8 +3662,14 @@ double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,co
       double ks=KeyLevelStop(dir,entry);                                       // fallback: recent swing (side-safe), else engine/ATR
       sl=(ks!=0.0)? ks : ComputeSL(dir,entry);
    }
-   //--- minimum distance: broker-min + the small anchor buffer (stay tight to the level) ---
-   double minD=MathMax(MinStopDist()+_Point, buf);
+   //--- minimum distance: broker-min AND a sane ATR floor. A structure level that sits CLOSER
+   //  than this means the entry is basically ON the level - a sub-ATR stop there just gets
+   //  picked off by normal gold-wick noise within a bar or two (the "opens and closes straight
+   //  away" bug), and the tiny risk also drags the RR-scaled TP into noise range. So the stop is
+   //  floored at InpMinSLAtr*ATR. gRecSizeMult lets a compressed/volatile curve run tighter
+   //  (~1 ATR in Extreme) while a wide curve gets ~1.9 ATR. The structure level is still used
+   //  whenever it sits FURTHER than this floor (the common case). ---
+   double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
    if(dir==1  && sl>entry-minD) sl=entry-minD;
    if(dir==-1 && sl<entry+minD) sl=entry+minD;
    //--- ATR safety cap ---
