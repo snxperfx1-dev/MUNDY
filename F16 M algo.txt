@@ -3586,22 +3586,30 @@ void ResolveOwnership()
    cur_newWaveOwn = clamp(cur_domTransfer,0.0,100.0);   // recursive wave that is taking control
    cur_oldWaveOwn = 100.0 - cur_newWaveOwn;             // the dominant wave being displaced
 
-   //--- transition complexity ---
-   bool atFlip = (InpUseV60Context ? ctx_atFlip : (cur_distFlipAtr<=1.0));
+   //--- proximity sanity: the OWNER's distance to its HTF objective. The ctx_atFlip flag is
+   //  unreliable (it was reading TRUE at 41 ATR away while a runaway terminal-shift counter
+   //  spun to 20/4), so the resolver uses the measured ATR distance as the real proximity test. ---
+   bool atFlipReal = (cur_distFlipAtr<=2.0);
    bool spring = (InpUseV60Context && ctx_failureSwing);
    bool termDn = (InpUseV60Context && ctx_termComplete);
-   if(atFlip || spring || termDn)            cur_transClass="Terminal";   // at the HTF flip / spring = terminal area
-   else if(cur_recDepth>=3 || r=="Extreme")  cur_transClass="Complex";    // many recursions
+
+   //--- transition complexity (Terminal only when ACTUALLY near the objective) ---
+   if(atFlipReal && (spring || termDn || (InpUseV60Context&&ctx_atFlip))) cur_transClass="Terminal";
+   else if(cur_recDepth>=3 || r=="Extreme")  cur_transClass="Complex";
    else if(cur_recDepth==2 || r=="High")     cur_transClass="Moderate";
-   else                                      cur_transClass="Simple";     // one curve / low compression
+   else                                      cur_transClass="Simple";
 
    //--- the keystone verdict: BUILDING (first strike) vs ENTRY CYCLE (transfer complete) ---
-   //  Entry cycle = the recursive wave has taken control (>=55%) AND enough recursions for the
-   //  compression have printed, OR a terminal spring / completed terminal sequence (fast entry),
-   //  OR the engine already reads "Entry Active". Otherwise we are still BUILDING -> wait.
-   bool transfer  = (cur_newWaveOwn>=55.0);
-   bool enoughRec = (cur_recDepth>=cur_recExpected);
-   if( (transfer && enoughRec) || spring || termDn || cur_entryReady=="Entry Active" )
+   //  ENTRY CYCLE REQUIRES GENUINE OWNERSHIP TRANSFER. The recursive wave must actually own price.
+   //  The spring / terminal-complete "accelerators" can only FAST-TRACK a transfer that is already
+   //  underway - they must be corroborated by real dominance (>=) and >=1 recursion AND real
+   //  proximity. This stops the bug where a runaway terminal counter (done=Y, shifts 20/4) forced
+   //  ENTRY_CYCLE on a first strike that the engine itself rated new=9% / rec 0 / entryP 4%. ---
+   bool core     = (cur_newWaveOwn>=55.0 && cur_recDepth>=cur_recExpected);                 // genuine transfer complete
+   bool springOK = (spring  && cur_recDepth>=1 && cur_newWaveOwn>=40.0);                     // spring: transfer underway, fast
+   bool termOK   = (termDn  && atFlipReal && cur_recDepth>=1 && cur_newWaveOwn>=45.0);       // terminal seq: must be corroborated + actually at the objective
+   bool engOK    = (cur_entryReady=="Entry Active" && cur_newWaveOwn>=45.0);                 // engine's own read, still needs real transfer
+   if( core || springOK || termOK || engOK )
       cur_ownVerdict="ENTRY_CYCLE";
    else
       cur_ownVerdict="BUILDING";
@@ -3904,7 +3912,7 @@ void TryEnter()
    bool _ctxOn=InpUseV60Context;
    bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
    int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
-   bool _atFlipNow=(_ctxOn?ctx_atFlip:(cur_distFlipAtr<=1.0));
+   bool _atFlipNow=((_ctxOn?ctx_atFlip:true) && cur_distFlipAtr<=2.0);   // require REAL proximity: ctx_atFlip alone misfired (TRUE at 41 ATR) and let the runaway shift counter qualify a terminal
    bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
    bool _freshRet=(cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer);
    //  TERMINAL entry = the NEW curve has taken control (dominance transferred / Entry Active /
