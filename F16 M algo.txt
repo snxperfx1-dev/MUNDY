@@ -3215,7 +3215,7 @@ input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:stru
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
-input double InpAnchorBufATR      = 0.25;  // STOP buffer beyond the curve-origin / invalidation level (xATR) - SYMPHONY-tight
+input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
 input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
 input double InpArcExtMult        = 1.5;   // ARC extension: apex = leg origin + leg*this (the projected curve apex)
 input double InpArcConvPower      = 1.5;   // ARC convexity power (time-curvature of the projected path)
@@ -3651,11 +3651,14 @@ double ComputeTP(const int dir,const double entry,const double sl)
    if(InpTPMode==TP_NETWORK){
       // FU pool / Invisible-Network attractor — the magnet price is heading for
       tp = !naf(ctx_netTarget)?ctx_netTarget : !naf(ctx_attractorPx)?ctx_attractorPx : entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-      //--- wide low-compression curve runs further -> project to the terminal (far FU flip) ---
-      if(InpCompSizing && InpUseV60Context && cur_compRegime=="Low"){
-         double far=(dir==1?ctx_fezHi:ctx_fezLo);
-         if(!naf(far) && ((dir==1&&far>tp)||(dir==-1&&far<tp))) tp=far;
-      }
+      //--- LET WINNERS RUN to the TERMINAL curve target (far FU flip / future-return-zone),
+      //  not just the nearest network attractor. The near magnet was capping winners around
+      //  1.5-2R while losers ran the full structure stop (the payoff-ratio bleed = "trades not
+      //  running"). Reach for the far terminal flip whenever it sits further in our direction;
+      //  the composite exhaustion exit banks genuine terminal exhaustion before a full round-
+      //  trip. (Previously this only applied in "Low" compression - now all regimes.) ---
+      double far=(dir==1?ctx_fezHi:ctx_fezLo);
+      if(!naf(far) && ((dir==1&&far>tp)||(dir==-1&&far<tp))) tp=far;
    } else if(InpTPMode==TP_ATR){
       tp=entry+(dir==1? atr*InpTPAtrMult : -atr*InpTPAtrMult);
    } else {
