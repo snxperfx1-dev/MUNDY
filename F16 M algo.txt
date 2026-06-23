@@ -102,7 +102,7 @@ input bool ecvLows           = true;
 input bool ecvExpansion      = true;
 input bool ecvPreConvexity   = true;
 input bool ecvConvexity      = true;
-input bool ecvAbsorption     = true;
+input bool ecvAbsorption     = true;   // SPEC: renamed conceptually to "Transition Environment" (recursive depth/CHOCH/compression/failure/dominance)
 input bool ecvRetracement    = true;
 input bool ecvInduction      = true;
 input bool ecvLiquidation    = true;
@@ -565,7 +565,9 @@ void ComputeSE(const ENUM_TIMEFRAMES tfReq, const int bars,
          if(phaseState==12 && ((dir==1&&bullCH)||(dir==-1&&bearCH))) phaseState=13;
       }
       //--- map v60 code -> Letra canonical code so Letra's combiner is unchanged ---
-      //  v60: 7 Transition->Absorption, 9 HTF Flip->Retr Pre-Cvx, 10 Induction->Retr Induction,
+      //  v60: 7 Transition Environment (was "Absorption" — SPEC: not a phase but a recursive
+      //  environment containing internal CHOCHs, compression, failure swings, dominance transfer),
+      //  9 HTF Flip->Retr Pre-Cvx, 10 Induction->Retr Induction,
       //       11 Liquidation/12 Terminal->Retr Liquidity, 13/14 Return->Demand/Supply Return.
       int v60c=phaseState;
       if(v60c==5 && dir==-1) v60c=6;
@@ -816,7 +818,7 @@ string f_phaseStr(const int c)
       case 4:  return("Expansion Liquidity");
       case 5:  return("New High");
       case 6:  return("New Low");
-      case 7:  return("Absorption");
+      case 7:  return("Transition Environment");
       case 8:  return("Retracement");
       case 9:  return("Retracement Pre-Convexity");
       case 10: return("Retracement Induction");
@@ -834,7 +836,7 @@ string f_hypFam(const string ph)
    if(ph=="Expansion Liquidity")       return("CONVEXITY FORMING");
    if(ph=="New High")                  return("CREATION FORMING");
    if(ph=="New Low")                   return("CREATION FORMING");
-   if(ph=="Absorption")                return("ABSORPTION");
+   if(ph=="Transition Environment")    return("TRANSITION ENVIRONMENT");
    if(ph=="Demand Return")             return("DEMAND/SUPPLY RETURN");
    if(ph=="Supply Return")             return("DEMAND/SUPPLY RETURN");
    return("RETRACEMENT");
@@ -843,15 +845,15 @@ string f_famSimple(const int f)
 {
    if(f==1) return("Expansion");
    if(f==2) return("Pre-Convexity");
-   if(f==4) return("Absorption");
+   if(f==4) return("Transition Environment");
    if(f==5) return("Liquidity");
-   if(f==6) return("Absorption");
+   if(f==6) return("Transition Environment");
    return("Expansion");
 }
 string f_famMicro(const int f)
 {
    if(f==2) return("M1 Convexity");
-   if(f==4) return("M1 Absorption");
+   if(f==4) return("M1 Transition Environment");
    if(f==5) return("M1 Liquidity");
    return("M1 Expansion");
 }
@@ -959,6 +961,7 @@ int    g_dwr_nextId=1,g_dwr_activeId=0;
 //--- last fully-processed chart bar index (for incremental state) ---
 int    g_lastProcessed=-1;
 datetime g_lastHTFbuild=0;
+double gStrikeATR=1.5;   // mirror of InpStrikeATR (input declared later; ContextRun runs earlier so it reads this global), set in OnInit
 
 
 //==================================================================
@@ -988,6 +991,14 @@ int    cur_expRecDepth=0;      // expected recursive cycles still possible (0..4
 double cur_transMaturity=0.0;  // transition maturity % (= dominance transfer)
 double cur_entryProb=0.0;      // entry-cycle probability %
 double cur_distFlipAtr=0.0;    // distance to HTF flip/objective in ATR
+//--- INCREMENT 1: Ownership / Transition Resolver outputs (read-only; "who owns price?") ---
+//  Symmetric (uses the OWNER curve's own dominance transfer / recursion / compression, NOT the
+//  lagging HTF netBias) so a top arms a SELL-side transition exactly like a bottom arms a BUY.
+string cur_transClass="-";     // Simple / Moderate / Complex / Terminal (transition complexity)
+int    cur_recExpected=1;      // recursions expected for this compression before transfer completes
+double cur_newWaveOwn=0.0;     // recursive (new) wave ownership %  (= dominance transfer)
+double cur_oldWaveOwn=100.0;   // dominant (old) wave ownership %   (= 100 - new)
+string cur_ownVerdict="BUILDING"; // BUILDING (first strike, still negotiating) / ENTRY_CYCLE (transfer complete, act)
 //--- prev-bar phase code per rung (persist across recomputes; NOT reset by ResetState) ---
 int    gPrevPhM1=-1,gPrevPhM3=-1,gPrevPhM5=-1,gPrevPhM15=-1,gPrevPhH1=-1,gPrevPhH4=-1;
 string cur_l0phase,cur_l1phase,cur_l2phase,cur_l3phase,cur_l4phase;
@@ -1588,7 +1599,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    string expectedNextPhase=
         (predScore_DemandReturn>=predScore_Retracement&&predScore_DemandReturn>=predScore_Absorption&&predScore_DemandReturn>=predScore_Creation&&predScore_DemandReturn>=predScore_Convexity&&predScore_DemandReturn>=predScore_Expansion)?(direction==-1?"Supply Return":"Demand Return"):
         (predScore_Retracement>=predScore_Absorption&&predScore_Retracement>=predScore_Creation&&predScore_Retracement>=predScore_Convexity&&predScore_Retracement>=predScore_Expansion)?"Retracement":
-        (predScore_Absorption>=predScore_Creation&&predScore_Absorption>=predScore_Convexity&&predScore_Absorption>=predScore_Expansion)?"Absorption":
+        (predScore_Absorption>=predScore_Creation&&predScore_Absorption>=predScore_Convexity&&predScore_Absorption>=predScore_Expansion)?"Transition Environment":
         (predScore_Creation>=predScore_Convexity&&predScore_Creation>=predScore_Expansion)?(direction==-1?"New Low":"New High"):
         (predScore_Convexity>=predScore_Expansion)?"Expansion Pre-Convexity":"Expansion";
    double expectedNextProb=_maxPredScore>0?fmin2(_maxPredScore/fmax2(_maxPredScore+30.0,1.0)*100.0,95.0):50.0;
@@ -1816,7 +1827,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    //==============================================================
    // SECTION 24 — TRADE STATE
    //==============================================================
-   bool exitCondition=(g_tradeDir==1&&bearBOS)||(g_tradeDir==-1&&bullBOS)||(g_tradeDir==1&&bearConvShift&&energy<g_prevEnergy)||(g_tradeDir==-1&&bullConvShift&&energy<g_prevEnergy)||(g_tradeDir==1&&htfAlign==-1)||(g_tradeDir==-1&&htfAlign==1)||(g_tradeDir!=0&&!obFresh)||(g_tradeDir!=0&&safeToReset)||(g_tradeDir==1&&bullInvalid)||(g_tradeDir==-1&&bearInvalid)||(g_tradeDir!=0&&(ie1a_currentPhase=="Absorption"||ie1a_currentPhase=="Retracement"));
+   bool exitCondition=(g_tradeDir==1&&bearBOS)||(g_tradeDir==-1&&bullBOS)||(g_tradeDir==1&&bearConvShift&&energy<g_prevEnergy)||(g_tradeDir==-1&&bullConvShift&&energy<g_prevEnergy)||(g_tradeDir==1&&htfAlign==-1)||(g_tradeDir==-1&&htfAlign==1)||(g_tradeDir!=0&&!obFresh)||(g_tradeDir!=0&&safeToReset)||(g_tradeDir==1&&bullInvalid)||(g_tradeDir==-1&&bearInvalid)||(g_tradeDir!=0&&(ie1a_currentPhase=="Transition Environment"||ie1a_currentPhase=="Retracement"));
    if(longSignal){ g_tradeDir=1; g_exitFiredBar=-1; }
    else if(shortSignal){ g_tradeDir=-1; g_exitFiredBar=-1; }
    else if(exitCondition&&g_tradeDir!=0){ g_exitFiredBar=i; g_tradeDir=0; }
@@ -1949,8 +1960,8 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    double l3_dominance=fmin2(nz(se3_mf)*0.60+nz(se3_wp)*0.40,100.0);
    string dominantWaveLevel=(l2_dominance>=l1_dominance&&l2_dominance>=l0_dominance&&l2_dominance>=l3_dominance)?"L2 HTF":(l1_dominance>=l0_dominance&&l1_dominance>=l3_dominance)?"L1 CHILD":(l0_dominance>=l3_dominance)?"L0 PRIMARY":"L3 MICRO";
    bool htfTrendIntact=l2_dominantPhase=="Expansion"&&g_l2_confidence>45.0;
-   bool ltfReversalForming=((fam_l0==4||fam_l0==5)||(l3_dominantPhase=="M1 Absorption"||l3_dominantPhase=="M1 Liquidity"))&&!(g_liqg_active&&!(liqg_objArrival&&liqg_trueCHoCH));
-   string fusionInterpretation=(htfTrendIntact&&!ltfReversalForming)?"HTF Intact - LTF Expansion Aligned":(htfTrendIntact&&ltfReversalForming)?"HTF Intact - LTF Reversal Forming":(!htfTrendIntact&&ltfReversalForming)?"HTF Weakening - LTF Reversal Confirming":(l2_dominantPhase=="Absorption"&&l1_dominantPhase=="Expansion")?"HTF Absorption - ITF Counter-Bounce":(l2_dominantPhase=="Liquidity"&&(l1_dominantPhase=="Absorption"||fam_l0==5))?"HTF Liq Sweep - Entry Zone Forming":"Mixed - Await Alignment";
+   bool ltfReversalForming=((fam_l0==4||fam_l0==5)||(l3_dominantPhase=="M1 Transition Environment"||l3_dominantPhase=="M1 Liquidity"))&&!(g_liqg_active&&!(liqg_objArrival&&liqg_trueCHoCH));
+   string fusionInterpretation=(htfTrendIntact&&!ltfReversalForming)?"HTF Intact - LTF Expansion Aligned":(htfTrendIntact&&ltfReversalForming)?"HTF Intact - LTF Reversal Forming":(!htfTrendIntact&&ltfReversalForming)?"HTF Weakening - LTF Reversal Confirming":(l2_dominantPhase=="Transition Environment"&&l1_dominantPhase=="Expansion")?"HTF Transition - ITF Counter-Bounce":(l2_dominantPhase=="Liquidity"&&(l1_dominantPhase=="Transition Environment"||fam_l0==5))?"HTF Liq Sweep - Entry Zone Forming":"Mixed - Await Alignment";
    double fusionConfidence=fmin2(g_l2_confidence*0.40+g_l1_confidence*0.30+l0_confidence*0.20+l3_confidence*0.10,100.0);
    double _cycleBaseProg=nz(waveProgress,0.0);
    double cycle1_completion=fmin2((g_entryCycle>=1?60.0:_cycleBaseProg*0.60)+(recursiveComplete&&g_entryCycle>=1?40.0:0.0),100.0);
@@ -1959,7 +1970,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    double cycle4_completion=fmin2((g_entryCycle>=4?60.0:g_entryCycle>=3?_cycleBaseProg*0.40:0.0)+(recursiveComplete&&g_entryCycle>=4?40.0:0.0),100.0);
    string activeCyclePhase=g_entryCycle==0?("Cycle 1 - "+l0_phaseCanon):("Entry Cycle "+IntegerToString(g_entryCycle)+" - "+l0_phaseCanon);
    double geoCapacityScore=fmin2((geoFullConvexityPossible?100.0:geoPartialConvexityPossible?60.0:25.0)*(!naf(flipzoneWidth)?fmax2(0.5,1.0-flipzoneWidth/fmax2(atr*4.0,1e-10)):0.5),100.0);
-   string geoCapacityNarrative=geoFullConvexityPossible?"Full Conv - Complete wave expression":geoPartialConvexityPossible?"Partial Conv - Limited but tradeable":"Absorption Only - Expect rapid absorption";
+   string geoCapacityNarrative=geoFullConvexityPossible?"Full Conv - Complete wave expression":geoPartialConvexityPossible?"Partial Conv - Limited but tradeable":"Transition Only - Expect rapid transition";
 
 
    //==============================================================
@@ -2070,7 +2081,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    bool _nePhaseExpBull=ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High";
    bool _nePhaseExpBear=ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New Low";
    bool _nePullback=ie1a_currentPhase=="Retracement"||ie1a_currentPhase=="Retracement Pre-Convexity"||ie1a_currentPhase=="Retracement Induction"||ie1a_currentPhase=="Retracement Liquidity";
-   string ne_dominantNarrative=displayWaveDir_M5==0?"No Clear Narrative":(displayWaveDir_M5==1&&_nePhaseExpBull&&rot_transferProbability<40)?"Bullish Continuation":(displayWaveDir_M5==-1&&_nePhaseExpBear&&rot_transferProbability<40)?"Bearish Continuation":(displayWaveDir_M5==1&&(_nePullback||ie1a_currentPhase=="Demand Return"))?"Bullish Pullback":(displayWaveDir_M5==-1&&(_nePullback||ie1a_currentPhase=="Supply Return"))?"Bearish Pullback":(displayWaveDir_M5==1&&(rot_transferProbability>=55||ie1a_currentPhase=="Absorption"))?"Bullish Reversal Developing":(displayWaveDir_M5==-1&&(rot_transferProbability>=55||ie1a_currentPhase=="Absorption"))?"Bearish Reversal Developing":(displayWaveDir_M5==1?"Bullish Developing":displayWaveDir_M5==-1?"Bearish Developing":"No Clear Narrative");
+   string ne_dominantNarrative=displayWaveDir_M5==0?"No Clear Narrative":(displayWaveDir_M5==1&&_nePhaseExpBull&&rot_transferProbability<40)?"Bullish Continuation":(displayWaveDir_M5==-1&&_nePhaseExpBear&&rot_transferProbability<40)?"Bearish Continuation":(displayWaveDir_M5==1&&(_nePullback||ie1a_currentPhase=="Demand Return"))?"Bullish Pullback":(displayWaveDir_M5==-1&&(_nePullback||ie1a_currentPhase=="Supply Return"))?"Bearish Pullback":(displayWaveDir_M5==1&&(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment"))?"Bullish Reversal Developing":(displayWaveDir_M5==-1&&(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment"))?"Bearish Reversal Developing":(displayWaveDir_M5==1?"Bullish Developing":displayWaveDir_M5==-1?"Bearish Developing":"No Clear Narrative");
    double ne_narrativeStrength=fmin2(mce_alignmentScore*0.40+rot_controlStability*0.30+(re_resolutionState=="RESOLVED"?30.0:re_resolutionState=="PARTIALLY RESOLVED"?15.0:0.0),100.0);
    //--- V72.5 INV ---
    double inv_bullOriginPrice=!naf(point4OriginLow)?point4OriginLow-atr*in_invOriginBuffer:NA;
@@ -2111,7 +2122,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    string doe_entryTrigger=frz_inProximity?"Limit":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?"LimitOnRetest":"Market";
    //--- V72.8b OPPORTUNITY ---
    double _opStruct=displayWaveDir_M5==0?0.0:(direction==displayWaveDir_M5?100.0:70.0);
-   double _opLifecycle=(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?100.0:(ie1a_currentPhase=="Absorption"||_nePullback)?70.0:(ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?55.0:(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="Expansion Pre-Convexity"||ie1a_currentPhase=="Expansion Induction"||ie1a_currentPhase=="Expansion Liquidity")?45.0:ie1a_currentPhase=="Point 4 Origin"?25.0:0.0;
+   double _opLifecycle=(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?100.0:(ie1a_currentPhase=="Transition Environment"||_nePullback)?70.0:(ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?55.0:(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="Expansion Pre-Convexity"||ie1a_currentPhase=="Expansion Induction"||ie1a_currentPhase=="Expansion Liquidity")?45.0:ie1a_currentPhase=="Point 4 Origin"?25.0:0.0;
    double _opReturn=naf(frz_distanceToZone)?(frz_inProximity?100.0:0.0):fmax2(0.0,100.0-frz_distanceToZone*40.0);
    double _opDisplace=fmax2(re_recursiveCompletionScore,ede_dissipationProgress);
    double _opConfluence=(frz_attractorConvergence?50.0:0.0)+((frz_inProximity&&frz_bestZoneDir==displayWaveDir_M5)?50.0:0.0);
@@ -2121,7 +2132,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    bool _opInZone=frz_inProximity&&frz_bestZoneDir==displayWaveDir_M5;
    string oppState=oppVeto?"STAND DOWN":(oppProgress>=95&&_opInZone)?"TRADE ACTIVE":oppProgress>=85?"PREPARE TO EXECUTE":oppProgress>=60?"OPPORTUNITY CONFIRMING":oppProgress>=20?"OPPORTUNITY FORMING":"STAND DOWN";
    string _cmdDirWord=displayWaveDir_M5==1?"Bullish":displayWaveDir_M5==-1?"Bearish":"Neutral";
-   string cmd_narrative=displayWaveDir_M5==0?"No directional thesis":inv_invalidated?_cmdDirWord+" thesis invalidated":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?_cmdDirWord+" return-to-zone - execution window":(rot_transferProbability>=55||ie1a_currentPhase=="Absorption")?_cmdDirWord+" reversal developing":(_nePullback||ie1a_currentPhase=="Retracement")?_cmdDirWord+" pullback in progress":(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?_cmdDirWord+" continuation":_cmdDirWord+" developing";
+   string cmd_narrative=displayWaveDir_M5==0?"No directional thesis":inv_invalidated?_cmdDirWord+" thesis invalidated":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?_cmdDirWord+" return-to-zone - execution window":(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment")?_cmdDirWord+" reversal developing":(_nePullback||ie1a_currentPhase=="Retracement")?_cmdDirWord+" pullback in progress":(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?_cmdDirWord+" continuation":_cmdDirWord+" developing";
    //--- registries ---
    V72Registries(i,direction,ie1a_currentPhase,re_recursiveCompletionScore,ede_expansionEnergy,ede_state,ede_liquidationBecomingDirectional,re_resolutionState);
    //--- traceability ---
@@ -2216,7 +2227,8 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
          double _px    = c[i];
          cur_distFlipAtr = (!naf(_destA))? MathAbs(_px-_destA)/_atr2 : 5.0;
          double _wavelen = fmax2(0.4, 2.0*(1.0-_oc/100.0));          // loop size: low comp ~2 ATR, high comp ~0.4 ATR
-         cur_expRecDepth = (int)fmin2(4.0, fmax2(0.0, MathRound(cur_distFlipAtr/_wavelen)));
+         double _depthCap = (_oc>=80.0)?5.0:4.0;                     // F72: Extreme compression can fit a 5th micro-recursion
+         cur_expRecDepth = (int)fmin2(_depthCap, fmax2(0.0, MathRound(cur_distFlipAtr/_wavelen)));
          cur_curveBudget = fmin2(100.0, cur_distFlipAtr*12.5);        // 8 ATR of room = "full" budget
          cur_transMaturity = cur_domTransfer;                         // dominance transfer % = how mature the transition is
          double _nearFlip = fmax2(0.0, 1.0 - cur_distFlipAtr/3.0);    // 1 at the flip, 0 beyond 3 ATR
@@ -2744,6 +2756,7 @@ double ctx_narrative=50.0; string ctx_narrState="HOLDING"; bool ctx_converging=f
 double ctx_chainVitality=50.0, ctx_mig50=NA, ctx_mig618=NA, ctx_retrX=50.0;
 //--- F72 campaign ownership: building (expansion -> flip) vs terminal (at the HTF FU flip zone) ---
 bool   ctx_atFlip=false;          // price has reached / is inside the HTF FU flip zone
+int    ctx_reversalSide=0;        // SYMMETRIC strike side: -1 = struck SUPPLY (hunt SELL), +1 = struck DEMAND (hunt BUY), 0 = not at a zone
 string ctx_campaign="EXPANSION";  // EXPANSION (building) / TERMINAL (at flip)
 double ctx_distFlipAtr=0.0;       // distance to the flip magnet in ATR
 bool   ctx_fuMerged=false;        // recursive curve respected the parent FU -> camp merged back (Principle 9)
@@ -2759,6 +2772,11 @@ bool   ctx_inManipBand=false;     // price is in the 0.618-0.786 fib band (manip
 double ctx_lowestFlip=NA;         // the lowest active on-bias flip = true S/D
 bool   ctx_atTrueInduction=false; // price is at the lowest flip (true induction zone = prime entry)
 bool   ctx_failureSwing=false;    // sweep beyond the true flip then reclaim in compression = spring (fast entry)
+//--- ARC v2 (SYMPHONY port): convex curved target trajectory ---
+double ctx_arcApex=NA;            // the projected convex APEX (curve target) for the current wave
+double ctx_arcNow=NA;             // time-projected expected price along the arc (wave-progress t)
+int    ctx_arcDir=0;              // direction the arc projects (+1 up / -1 down)
+double ctx_cExtreme=NA;           // raw current leg extreme (published by ContextRun, consumed by ComputeARC)
 //--- persistent terminal-counter state (updated once per bar) ---
 bool   g_termActive=false; int g_termShifts=0; int g_termPrevDirM5=0;
 //--- TIE detail ---
@@ -3011,10 +3029,26 @@ void ContextRun(const int bars)
    //  reached the FU flip zone, where induction/liquidation/entry-cycle happens.
    //  The FU flip zone is already mapped (network attractor / FEZ corridor).
    double _flipMag = !naf(attractorPx)?attractorPx : nz(netTarget,c_tgt);
-   bool   _inFez   = (!naf(fezHi)&&!naf(fezLo)&&clL<=fezHi&&clL>=fezLo);
-   double _distMag = (!naf(_flipMag))?MathAbs(clL-_flipMag):NA;
-   ctx_distFlipAtr = (!naf(_distMag)&&atrL>0)?_distMag/atrL : 5.0;
-   ctx_atFlip   = _inFez || (!naf(_distMag) && _distMag<=atrL*1.0);
+   //  SYMMETRIC S/D STRIKE: fezHi = strongest SUPPLY node above price, fezLo = strongest DEMAND
+   //  node below (both already found regardless of bias). "At flip" = price has actually REACHED
+   //  one of them (within 1 ATR) - a genuine strike into HTF supply (-> hunt SELL) or demand
+   //  (-> hunt BUY). Replaces the old loose "between two nodes" test that misfired (atFlip=Y at
+   //  41 ATR) and the bias-locked one-sided detection that could only see one direction. ---
+   double _distSup = (!naf(fezHi))? MathAbs(clL-fezHi) : NA;   // distance to supply above
+   double _distDem = (!naf(fezLo))? MathAbs(clL-fezLo) : NA;   // distance to demand below
+   bool   _strikeSup = (!naf(_distSup) && atrL>0 && _distSup<=atrL*gStrikeATR);
+   bool   _strikeDem = (!naf(_distDem) && atrL>0 && _distDem<=atrL*gStrikeATR);
+   double _nearDist = NA;
+   if(!naf(_distSup) && !naf(_distDem)) _nearDist=fmin2(_distSup,_distDem);
+   else if(!naf(_distSup))              _nearDist=_distSup;
+   else if(!naf(_distDem))              _nearDist=_distDem;
+   ctx_distFlipAtr = (!naf(_nearDist)&&atrL>0)? _nearDist/atrL : 5.0;
+   ctx_atFlip   = _strikeSup || _strikeDem;                    // genuine proximity to a real S/D node
+   //  reversal side at the strike: supply -> SELL (-1), demand -> BUY (+1); nearer node wins if pinched
+   if(_strikeSup && _strikeDem) ctx_reversalSide = (_distSup<=_distDem? -1 : 1);
+   else if(_strikeSup)          ctx_reversalSide = -1;
+   else if(_strikeDem)          ctx_reversalSide = 1;
+   else                         ctx_reversalSide = 0;
    ctx_campaign = ctx_atFlip ? "TERMINAL (at flip)" : "EXPANSION (building)";
    //  Principle 9 — FU camp merge: a fresh FU node that sits at the SAME flip zone as
    //  the network attractor means the recursive curve respected the parent FU, so the
@@ -3024,7 +3058,7 @@ void ContextRun(const int bars)
    //  Wyckoff terminal sequence: count recursive change-of-character shifts WHILE inside the
    //  flip zone (the spring/test/LPS1/LPS2 - "always four"). Entry matures on the completing
    //  shift, not the first strike. Compression sets how many shifts to expect (tight -> fewer/faster).
-   int _expShifts=(int)clamp(nz((double)cur_expRecDepth,3.0),2.0,4.0);
+   int _expShifts=(int)clamp(nz((double)cur_expRecDepth,3.0),3.0,5.0);   // F72: Wyckoff terminal is ~4 shifts, min 3
    if(ctx_fuMerged) _expShifts=(int)MathMin(_expShifts+3,7);   // Principle 9: camp merged back -> cycle still owes ~3 more recursions
    if(!ctx_atFlip){ g_termActive=false; g_termShifts=0; ctx_termM1Cycles=0; g_termPrevDirM1=cur_dirM1; }
    else {
@@ -3036,19 +3070,25 @@ void ContextRun(const int bars)
    //  terminal completes when M5 shifts reach the expected count, OR (on a larger-TF owner where
    //  the terminal only nests on M1) when the M1 sub-cycles reach ~2x the expected.
    bool _htfOwner=(cur_curveOwner=="H1"||cur_curveOwner=="H4"||cur_curveOwner=="M15");
-   ctx_termComplete=(ctx_atFlip && (g_termShifts>=_expShifts || (_htfOwner && ctx_termM1Cycles>=2*_expShifts)));
+   //  RUNAWAY GUARD: a clean terminal completes and price LEAVES the zone. If shifts pile up far
+   //  beyond expected, price is RANGING at the node (chop) - that is NOT a completed terminal, and
+   //  the counter is re-armed so a fresh sequence can be recognised (this was the shifts=20/4,
+   //  done=Y false positive that forced a bad ENTRY_CYCLE). ---
+   if(ctx_atFlip && g_termShifts>3*_expShifts){ g_termActive=false; g_termShifts=0; ctx_termM1Cycles=0; ctx_termShifts=0; }
+   ctx_termComplete = ctx_atFlip && (
+        (g_termShifts>=_expShifts && g_termShifts<=3*_expShifts)
+     || (_htfOwner && ctx_termM1Cycles>=2*_expShifts && ctx_termM1Cycles<=6*_expShifts) );
 
-   //  Part 3 — manipulation band vs true induction. The 0.618/0.70/0.786 fib band of the
-   //  owner leg is where participants manipulate (displacement, NOT the entry). True induction
-   //  happens at the LOWEST flip (deepest demand / highest supply = true S/D). Entries align
-   //  to the true flip, not the manipulation wicks.
-   ctx_lowestFlip = lowFlipPx;
-   ctx_atTrueInduction = (!naf(lowFlipPx) && atrL>0 && MathAbs(clL-lowFlipPx)<=atrL*0.75);
-   //  failure swing (spring): in High/Extreme compression price sweeps BEYOND the true flip
-   //  then reclaims it on the close - that IS the terminal spring, entry comes fast.
+   //  Part 3 — manipulation band vs true induction. True induction = price is AT the STRUCK S/D
+   //  node (supply if the reversal is SELL, demand if BUY) — symmetric, not bias-locked. ---
+   double _struckNode = (ctx_reversalSide==-1? fezHi : ctx_reversalSide==1? fezLo : lowFlipPx);
+   ctx_lowestFlip = _struckNode;
+   ctx_atTrueInduction = (!naf(_struckNode) && atrL>0 && MathAbs(clL-_struckNode)<=atrL*0.75);
+   //  failure swing (spring), SYMMETRIC: at SUPPLY sweep ABOVE then reclaim below = bearish spring;
+   //  at DEMAND sweep BELOW then reclaim above = bullish spring. High/Extreme compression only. ---
    bool _comp=(cur_compRegime=="High"||cur_compRegime=="Extreme");
-   bool _fsL=(!naf(lowFlipPx)&&netBias>=0&&d.l[last]<lowFlipPx&&clL>lowFlipPx);
-   bool _fsS=(!naf(lowFlipPx)&&netBias<=0&&d.h[last]>lowFlipPx&&clL<lowFlipPx);
+   bool _fsS=(ctx_reversalSide==-1 && !naf(fezHi) && d.h[last]>fezHi && clL<fezHi);  // bearish spring at supply
+   bool _fsL=(ctx_reversalSide==1  && !naf(fezLo) && d.l[last]<fezLo && clL>fezLo);  // bullish spring at demand
    ctx_failureSwing=(ctx_atFlip && _comp && (_fsL||_fsS));
    ctx_inManipBand = false;
    if(!naf(cExtreme) && !naf(c_inv) && cExtreme!=c_inv){
@@ -3067,6 +3107,9 @@ void ContextRun(const int bars)
    ctx_life=life; ctx_cpForce=cpForce; ctx_cpState=cpState; ctx_alive=aliveTx; ctx_h1Timing=h1Timing; ctx_wp=c_wp; ctx_atr=atrL;
    ctx_narrative=narrative; ctx_narrState=narrState; ctx_converging=converging; ctx_chainVitality=chainVitality;
    ctx_mig50=mig50; ctx_mig618=mig618; ctx_retrX=retrX;
+   //--- ARC v2 (SYMPHONY port): publish the raw leg extreme only; the convex apex is built in
+   //  ComputeARC() (EA section) so it can use the ARC inputs declared there (declare-before-use). ---
+   ctx_cExtreme=cExtreme;
 }
 
 
@@ -3080,8 +3123,7 @@ void ContextRun(const int bars)
 enum ENUM_SIG_SOURCE { SIG_ENGINE, SIG_V72, SIG_EITHER, SIG_BOTH };   // arrows / DOE / either(OR) / both(AND)
 enum ENUM_LOT_MODE   { LOT_FIXED, LOT_RISK_PCT };
 enum ENUM_SL_MODE    { SL_ENGINE, SL_ATR, SL_FIXED };
-enum ENUM_TP_MODE    { TP_NETWORK, TP_RR, TP_ATR };   // FU/Invisible-Network attractor / RR / ATR
-enum ENUM_TRAIL_MODE { TRAIL_ATR, TRAIL_POINTS };
+//  SPEC AUDIT: ENUM_TP_MODE and ENUM_TRAIL_MODE removed (no TP targets, no trailing).
 enum ENUM_MIN_GRADE  { G_APLUS, G_A, G_B, G_C, G_D };
 
 //==================================================================
@@ -3106,8 +3148,16 @@ input group "Letra37 EA - Risk / Sizing"
 input ENUM_LOT_MODE InpLotMode          = LOT_RISK_PCT; // Position sizing mode
 input double        InpFixedLot         = 0.10;         // Fixed lot (LOT_FIXED)
 input double        InpRiskPercent      = 1.0;          // Risk % of equity (LOT_RISK_PCT)
-input double        InpMaxLot           = 5.0;          // Hard lot cap
+input double        InpMaxLot           = 2.0;          // Hard lot cap (reduced from 5: 5 lots/100k was ~3-5% risk/trade -> 96% DD)
 input int           InpMaxSpreadPoints  = 0;            // Max spread (points); 0=off (gold spreads are large!)
+input int           InpSlippageBufPoints= 0;            // SLIPPAGE CUSHION: add these points to the stop distance used for SIZING only (smaller lot on tight stops, so a fast-reversal slip doesn't blow past intended risk). 0=off. Try 200-600 on gold.
+
+input group "Letra37 EA - Small Account Mode (toggle)"
+input bool          InpSmallAccount       = false;      // TOGGLE: apply small-account sizing/limits below (overrides risk% + lot cap)
+input double        InpSmallAcctRiskPct   = 0.5;        // Small-acct: risk % per trade (lower than the standard InpRiskPercent)
+input double        InpSmallAcctMaxLot    = 0.10;       // Small-acct: hard lot cap (micro sizing)
+input double        InpSmallAcctMaxRiskPct= 2.0;        // Small-acct: SKIP a trade if even the broker-minimum lot would risk more than this % (can't size smaller)
+input int           InpSmallAcctMaxTrades = 5;          // Small-acct: max new trades/day (0=use the standard limit)
 
 input group "Letra37 EA - Stop Loss"
 input ENUM_SL_MODE  InpSLMode           = SL_ENGINE;    // Stop-loss source
@@ -3119,41 +3169,58 @@ input bool          InpUseKeyLevelStop  = true;         // Anchor SL beyond the 
 input int           InpSwingLookback    = 20;           // Bars scanned for the protective key swing high/low
 input double        InpKeyLevelBufATR   = 0.80;         // Buffer beyond the key high/low (xATR) - gold wicks are large
 input double        InpMaxSLAtr         = 10.0;         // Safety cap on total SL distance (xATR)
+input int           InpMaxSLPoints      = 600;          // HARD cap: stop-loss can NEVER be further than this many points/ticks from entry (0=off). Caps risk per trade regardless of structure/ATR.
 input bool          InpCompSizing       = true;         // Recursion-size-aware sizing: compression sets stop distance + partial timing (wide loop=wider stop, failure-swing=tighter)
 
 input group "Letra37 EA - Take Profit"
-input ENUM_TP_MODE  InpTPMode           = TP_NETWORK;   // Take-profit source (FU / Invisible-Network attractor)
-input double        InpTPrr             = 2.0;          // TP = RR * risk (TP_RR)
-input double        InpTPAtrMult        = 3.0;          // TP = ATR * mult (TP_ATR)
-input bool          InpUsePartial       = true;         // Partial close at first target
-input double        InpPartialPct       = 50.0;         // Partial close % at TP1
-input bool          InpMoveBEAfterTP1   = false;        // Move SL to BE after partial (off - BE now uses 3R/900 rule)
+//  SPEC AUDIT: ALL take-profit logic REMOVED. Campaigns are NOT closed because a reward ratio
+//  was reached. The position lives until ownership transfers or the campaign's terminal sequence
+//  completes. The broker order has TP=0 (no server TP). Structure SL remains the only hard stop.
+//  (Retained as empty group for input-ordering backward compat; inputs deleted.)
 
-input group "Letra37 EA - Trade Management"
-input bool          InpUseBreakeven     = true;         // Enable break-even
-input double        InpBETriggerRR      = 3.0;          // BE trigger in RR (also see ticks below)
-input double        InpBETriggerPoints  = 900;         // BE trigger in ticks/points (whichever hits first)
-input int           InpBEOffsetPoints   = 20;          // BE offset (points, locked profit)
-input bool          InpUseTrailing      = true;         // Enable trailing stop
-input ENUM_TRAIL_MODE InpTrailMode      = TRAIL_ATR;    // Trailing mode
-input double        InpTrailAtrMult     = 2.0;          // Trail distance = ATR * mult
-input int           InpTrailPoints      = 200;          // Trail distance (points)
-input int           InpTrailStepPoints  = 20;           // Min step to move trail (points)
-input bool          InpExitOnOpposite   = true;         // Close on opposite engine signal
-input bool          InpExitOnInvalid    = true;         // Close on engine invalidation
-input bool          InpExitOnPhaseFlip  = false;        // Close on Absorption/Retracement phase (off - was cutting too early)
-input int           InpMinHoldBars      = 5;            // Min bars to hold before ANY discretionary exit (SL/TP always active)
-input bool          InpHoldWithThesis   = true;         // HOLD a bias-aligned trade through opposite signals while the thesis still supports it
-input bool          InpExitOnThesisFlip = true;         // CLOSE an open trade when the dominant thesis flips against it (keeps the position matching the panel)
+input group "Letra37 EA - Trade Management (F72 OWNERSHIP EXITS ONLY)"
+//  SPEC AUDIT: break-even, trailing, partial, session-end, thesis-flip, phase-flip, opposite-
+//  signal, life-score, narrative — ALL removed. Recursive waves naturally contain pullbacks,
+//  internal liquidation, and ownership oscillation that are NORMAL, not exit signals.
+//  EXIT ONLY on (1) ownership transfer, (2) terminal sequence completion, (3) Phase-2 CHOCH
+//  against position. These are computed from live engine state each bar.
+input int           InpMinHoldBars      = 3;            // Min bars to hold before ANY campaign exit fires (protects against entry-bar reversal noise)
+input bool          InpExitOnOwnerTransfer = true;      // EXIT: close when curve OWNERSHIP has fully transferred away from the trade's campaign direction
+input double        InpOwnerTransferThresh = 65.0;      // Ownership transfer %: the opposing curve must dominate by at least this % to confirm transfer
+input bool          InpExitOnTermComplete  = true;      // EXIT: close when the terminal sequence of the campaign's S/D transition has completed (campaign naturally finished)
+input bool          InpExitOnP2CHOCH       = true;      // EXIT: close when a Phase-2 CHOCH prints against the position (internal structure proves campaign failure)
+input int           InpP2CHOCHConfirmBars  = 2;         // Bars of continued adverse structure to confirm a genuine P2 CHOCH (vs. wick noise)
+
+input group "Letra37 EA - Account Profit Guard (equity protection overlay)"
+//  OVERLAY on top of the pure ownership engine: protects realized equity as floating profit
+//  grows, measured as % of ACCOUNT BALANCE (not RR / not curve logic). Each tier latches once.
+//  This is a deliberate risk choice that scales OUT of winners — it WILL cap the biggest runners
+//  vs. the pure ownership engine. Toggle OFF to run the unmodified ownership engine.
+input bool          InpUseProfitGuard   = true;         // Master toggle for the account profit guard
+input double        InpPG_Tier1USD      = 1500;         // Tier 1: floating profit >= this $ -> move SL to break-even + scale out to Tier1Close
+input double        InpPG_Tier1Close    = 20.0;         // Tier 1: cumulative % of ORIGINAL volume closed
+input double        InpPG_Tier2USD      = 2500;         // Tier 2: profit >= this $ -> scale out more
+input double        InpPG_Tier2Close    = 40.0;         // Tier 2: cumulative % of original closed
+input double        InpPG_Tier3USD      = 4000;         // Tier 3: profit >= this $ -> scale out + start trailing
+input double        InpPG_Tier3Close    = 60.0;         // Tier 3: cumulative % of original closed
+input double        InpPG_Tier4USD      = 7000;         // Tier 4: profit >= this $ -> scale out + trail
+input double        InpPG_Tier4Close    = 80.0;         // Tier 4: cumulative % of original closed
+input double        InpPG_Tier5USD      = 10000;        // Tier 5: profit >= this $ -> scale out + trail
+input double        InpPG_Tier5Close    = 100.0;        // Tier 5: cumulative % of original closed (100 = fully out / bank the move; <100 leaves a runner)
+input bool          InpPG_BEAtTier1     = true;         // Move SL to break-even when Tier 1 fires
+input bool          InpPG_TrailFromTier3= true;         // Trail the remainder once Tier 3+ is active
+input double        InpPG_TrailAtrMult  = 2.0;          // Trailing distance (xATR) for the remainder
+input int           InpPG_BEOffsetPoints= 20;           // Break-even offset (points of locked profit) when Tier 1 fires
+input double        InpMaxLossPctBal    = 2.5;          // HARD BACKSTOP: force-close ANY position whose floating loss exceeds this % of balance (catches a missing/naked stop regardless of broker SL). 0 = off
 
 input group "Letra37 EA - Session / Guards"
-input bool          InpUseSession       = false;        // Restrict trading hours (server time)
+input bool          InpUseSession       = false;        // Restrict NEW ENTRY hours (server time) — does NOT close existing campaigns
 input int           InpSessStartHour    = 7;            // Session start hour
 input int           InpSessEndHour      = 20;           // Session end hour
 input bool          InpSkipFriday       = false;        // No new trades on Friday
-input bool          InpCloseAtSessEnd   = false;        // Close all at session end
-input double        InpMaxDailyLossPct  = 5.0;          // Halt after daily loss % (0=off)
-input int           InpMaxTradesPerDay  = 20;           // Max new trades per day (0=off)
+//  SPEC AUDIT: InpCloseAtSessEnd REMOVED (session exit artificially terminates campaigns).
+//  SPEC AUDIT: InpMaxDailyLossPct REMOVED (daily risk closure is an external constraint, not curve logic).
+input int           InpMaxTradesPerDay  = 20;           // Max new trades per day (0=off) — limits ENTRIES, not exits
 
 input group "Letra37 EA - Misc"
 input ulong         InpMagic            = 370037;       // Magic number
@@ -3161,14 +3228,24 @@ input ulong         InpDeviation        = 20;           // Max slippage (points)
 input string        InpComment          = "Letra37";    // Order comment
 input bool          InpShowStatus       = true;         // Show status panel (Comment)
 input bool          InpDebugEntries     = true;         // Print full entry reasoning to the Experts log (why each trade was taken)
-input bool          InpDebugBlocks      = false;        // Also log why entries are BLOCKED (verbose - maps near-misses)
+input bool          InpDebugBlocks      = true;         // Log why entries are BLOCKED (verbose) - ON so 'no trades' is diagnosable: prints the gate + OWNS verdict + values each bar
 input bool          InpDebugExits       = true;         // Print why each trade was CLOSED / its stop moved (maps early-exit & stop problems)
+
+input group "Letra37 EA - Live Safety"
+input bool   InpVerifyTradeAllowed = true;  // LIVE: only place NEW orders when the terminal is connected and algo-trading is permitted (terminal + account + EA)
+input int    InpOrderRetries       = 3;     // LIVE: retry a market order this many times on a TRANSIENT broker error (requote / price changed / off-quotes / timeout)
+input int    InpRetryWaitMs        = 200;   // LIVE: wait between order retries (ms)
+input double InpMarginBufferPct    = 5.0;   // LIVE: keep this % of free margin unused - block a new entry that would consume more
+input bool   InpHaltOnLowMargin    = true;  // LIVE: block new entries when the margin level is unsafe
+//--- SLIPPAGE GUARD (entry-side: the only slippage an EA can actually control) ---
+input int    InpMaxEntrySlipPoints = 100;   // SLIPPAGE GUARD: reject a market entry if price has moved more than this many points from the intended price at send time (don't chase a fast move). 0 = off
+input bool   InpLogSlippage        = true;  // Log requested-vs-filled entry price so you can measure real slippage in the Experts log
 
 input group "Letra37 EA - v60 Context Filters"
 input bool   InpUseV60Context   = true;    // Compute v60 context (network / curve-life / TIE / narrative)
 input bool   InpReqNetAgree     = true;    // Require Invisible-Network bias to agree (or neutral)
 input bool   InpReqStackAgree   = false;   // Require v60 fractal stack to agree
-input bool   InpReqCurveAlive   = true;    // Require curve-life not DEAD at entry
+input bool   InpReqCurveAlive   = false;   // Require curve-life not DEAD at entry (OFF - a high/"alive" life = a MATURE curve near its top; requiring it biased entries to the END of the move. Life is a WINNER-management tool, not an entry filter)
 input double InpCurveAliveMin   = 33.0;    // Min curve-life to allow entry
 input bool   InpReqNarrative    = false;   // Require narrative not WEAKENING
 input bool   InpReqTimeAlign    = false;   // Require time-cycle alignment
@@ -3186,7 +3263,7 @@ input int    InpMinEntryRung     = 1;      // Lowest rung allowed for a multi-TF
 input double InpMinDomTransfer   = 45.0;   // Min dominance-transfer % to treat a Return as an ENTRY CYCLE (below = first strike, wait)
 input double InpMinEntryProb     = 0.0;    // Optional: min entry-cycle probability % to allow a multi-TF entry (0 = off)
 input bool   InpRequireAtFlip    = false;  // Optional: only take multi-TF entries when price is AT the HTF FU flip zone (terminal side)
-input int    InpMinTermShifts    = 0;      // Optional: at the flip zone, require N terminal shifts (Wyckoff ~4) before entering (0 = off)
+input int    InpMinTermShifts    = 3;      // F72: require N terminal shifts (Wyckoff ~4, min 3) before entry; failure-swing / Extreme compression bypasses (fire fast)
 input bool   InpAvoidManipBand   = true;   // Skip entries in the 0.618-0.786 manipulation band (displacement trap) unless at true induction
 input bool   InpRequireTrueInduction = false; // Optional: only enter at the LOWEST flip (true S/D induction zone)
 input bool   InpBlockCounterBias = true;   // VETO any entry (incl. arrows/DOE) opposing the dominant thesis (narrative+DOE+network+wave+stack)
@@ -3199,6 +3276,36 @@ input bool   InpUseMigrationTrail= false;  // Keep stop at ownership-migration 0
 input bool   InpUseNarrativeMgmt= false;   // Manage with narrative lineage / chain vitality (OFF - same decay-close problem)
 input double InpChainExitBelow  = 25.0;    // Exit when chain vitality <= this (story decayed across curves)
 
+input group "Letra37 EA - F72 Entry Cycle (curve ownership)"
+input bool   InpRequireEntryCycle = true;  // F72: only enter once the ENTRY CYCLE has begun (build-vs-execute) - applies to ALL sources (arrows/DOE/FU/MTF)
+input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme compression or on a failure-swing (compressed/volatile curves fire fast - never miss them)
+//  SPEC AUDIT: InpMinEntryRR REMOVED (was testing against a TP target that no longer exists; campaigns have no RR ceiling)
+input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
+
+input group "Letra37 EA - F72 v6 Ownership Gate (who owns price)"
+input bool   InpUseOwnershipGate     = true;  // v6: gate entries on the symmetric Ownership Resolver (BUILDING vs ENTRY_CYCLE). The keystone fix - only act once the recursive transition has completed and the new wave owns price (works at tops AND bottoms)
+input bool   InpOwnGateBlockBuilding = true;  // Suppress entries while the owner curve is still BUILDING / first-strike (kills the range-top chop). A fast spring still bypasses
+input bool   InpOwnGateRangeStrict   = true;  // In RANGEBOUND destinations only take a TERMINAL entry-cycle at the extreme (no mid-range returns)
+//--- ENTRY-CYCLE thresholds (calibrate from the chart). first strike = recursion 0 -> wait;
+//    entry cycle = recursion has BEGUN + dominance shifting -> act (NOT 'wait for full completion'). ---
+input double InpEC_MinNewOwn         = 40.0;  // ENTRY_CYCLE: min new-wave ownership % (recursive wave gaining control). Lower = enters earlier / more trades
+input int    InpEC_MinRecDepth       = 1;     // ENTRY_CYCLE: min recursions (phase-2 CHoCHs) - >=1 means the transition has actually started (0 = raw first strike = wait)
+input double InpStrikeATR            = 1.5;   // S/D STRIKE proximity: price is 'at' a supply/demand node within this many ATR (wider = registers strikes sooner)
+
+input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
+input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
+input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
+input double InpArcExtMult        = 1.5;   // ARC extension: apex = leg origin + leg*this (the projected curve apex)
+input double InpArcConvPower      = 1.5;   // ARC convexity power (time-curvature of the projected path)
+input bool   InpUseExhaustionExit = true;  // Composite EXIT: close on ARC-apex + wave/phase collapse + sweep-reclaim (terminal exhaustion)
+input double InpArcTolATR         = 0.20;  // How close to the ARC apex counts as "reached" (xATR)
+
+input group "Letra37 EA - SYMPHONY Entry Trigger (precise 'when')"
+input bool   InpUseSymphonyTrigger = true; // Require the SYMPHONY EVENT trigger: enter on the closed-bar momentum inflection (the turn), not just on a true state
+input bool   InpRequireMomFlip     = true; // Require the bar-to-bar momentum DELTA to flip INTO the trade direction (the inflection bar)
+input double InpEntryRetrMin       = 0.30; // Continuation entries: min retracement fraction of the leg (SYMPHONY 0.30)
+input double InpEntryRetrMax       = 0.80; // Continuation entries: max retracement fraction (beyond = too deep -> skip)
+
 //==================================================================
 // EA GLOBALS
 //==================================================================
@@ -3209,9 +3316,7 @@ CAccountInfo  gAccount;
 
 datetime gLastBarTime   = 0;
 datetime gDayStamp      = 0;
-double   gDayStartEquity= 0.0;
 int      gTradesToday   = 0;
-bool     gHalted        = false;
 string   gEntryBlock    = "-";   // live reason the EA is NOT entering (shown in panel)
 double   gRecSizeMult   = 1.0;   // recursion-size-aware stop multiplier (set per entry from compression)
 bool     gMktClosed     = false; // set when a management/flip order is rejected with 'Market closed' - stops the every-tick retry storm; reset each new bar (server SL/TP still protect the position)
@@ -3221,6 +3326,8 @@ datetime eaT[]; double eaO[],eaH[],eaL[],eaC[],eaVol[];
 
 //--- per-ticket management memory ---
 ulong  gMgTicket[]; double gMgInitSL[]; double gMgTP1[]; bool gMgPartialDone[]; bool gMgBEDone[]; int gMgDir[];
+//--- account profit-guard memory: original volume (for scale-out targets) + which tier has fired (0..3) ---
+double gMgOrigVol[]; int gMgPGTier[];
 
 //==================================================================
 // HELPERS
@@ -3253,7 +3360,8 @@ double NormalizeLot(double lot)
    lot=MathFloor(lot/step)*step;
    if(lot<minlot) lot=minlot;
    if(lot>maxlot) lot=maxlot;
-   if(lot>InpMaxLot) lot=InpMaxLot;
+   double cap=(InpSmallAccount? MathMin(InpMaxLot,InpSmallAcctMaxLot) : InpMaxLot);
+   if(lot>cap) lot=cap;
    return(lot);
 }
 
@@ -3268,28 +3376,52 @@ double MoneyPerPointPerLot()
 double CalcLot(const double entry,const double sl)
 {
    if(InpLotMode==LOT_FIXED) return(NormalizeLot(InpFixedLot));
-   double riskMoney=gAccount.Equity()*InpRiskPercent/100.0;
+   double riskPct=(InpSmallAccount? InpSmallAcctRiskPct : InpRiskPercent);   // small-account mode uses its own (lower) risk %
+   double riskMoney=gAccount.Equity()*riskPct/100.0;
    double slPts=MathAbs(entry-sl)/_Point;
+   slPts+=MathMax(0,InpSlippageBufPoints);   // SLIPPAGE CUSHION: size as if the stop were this much wider -> smaller lot on tight stops, so a fast-reversal slip stays within intended risk
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
    double lot=riskMoney/(slPts*mpp);
-   return(NormalizeLot(lot));
+   return(NormalizeLot(lot));                                 // NormalizeLot enforces broker min/step and the InpMaxLot cap
+}
+
+//--- ARC v2 apex builder (SYMPHONY port): uses the ARC inputs (declared in the EA section) and
+//  the raw leg values published by ContextRun. apex = leg origin + dir*leg*ExtMult (the convex
+//  curve target); ctx_arcNow is the time-projected expected price along the arc. ---
+void ComputeARC()
+{
+   ctx_arcApex=NA; ctx_arcNow=NA; ctx_arcDir=0;
+   int    wd =ctx_waveDir;
+   double org=ctx_stop;        // leg origin = invalidation / protective extreme
+   double ext=ctx_cExtreme;    // current leg extreme
+   if(wd==0 || naf(org) || naf(ext)) return;
+   double imp=MathAbs(ext-org);
+   if(imp<=0.0) return;
+   double apex=org + (double)wd*imp*InpArcExtMult;
+   double t   =clamp(ctx_wp/100.0,0.0,1.0);
+   ctx_arcApex=apex;
+   ctx_arcNow =org + (apex-org)*MathPow(t,InpArcConvPower);
+   ctx_arcDir =wd;
 }
 
 //--- management memory ---
 int MgIndex(const ulong tk){ for(int q=0;q<ArraySize(gMgTicket);q++) if(gMgTicket[q]==tk) return(q); return(-1); }
-void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir)
+void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir,const double origVol=0.0)
 {
    if(MgIndex(tk)>=0) return;
    int s=ArraySize(gMgTicket);
    ArrayResize(gMgTicket,s+1);ArrayResize(gMgInitSL,s+1);ArrayResize(gMgTP1,s+1);ArrayResize(gMgPartialDone,s+1);ArrayResize(gMgBEDone,s+1);ArrayResize(gMgDir,s+1);
+   ArrayResize(gMgOrigVol,s+1);ArrayResize(gMgPGTier,s+1);
    gMgTicket[s]=tk; gMgInitSL[s]=initSL; gMgTP1[s]=tp1; gMgPartialDone[s]=false; gMgBEDone[s]=false; gMgDir[s]=dir;
+   gMgOrigVol[s]=origVol; gMgPGTier[s]=0;
 }
 void MgCleanup()
 {
    for(int q=ArraySize(gMgTicket)-1;q>=0;q--){
       if(!posinfo.SelectByTicket(gMgTicket[q])){
          ArrayRemove(gMgTicket,q,1);ArrayRemove(gMgInitSL,q,1);ArrayRemove(gMgTP1,q,1);ArrayRemove(gMgPartialDone,q,1);ArrayRemove(gMgBEDone,q,1);ArrayRemove(gMgDir,q,1);
+         ArrayRemove(gMgOrigVol,q,1);ArrayRemove(gMgPGTier,q,1);
       }
    }
 }
@@ -3363,9 +3495,49 @@ int OnInit()
    ResetState();
    g_lastProcessed=-1;
 
-   gDayStamp=0; gTradesToday=0; gHalted=false;
-   gDayStartEquity=gAccount.Equity();
+   gDayStamp=0; gTradesToday=0;
    gLastBarTime=0;
+   gStrikeATR=(InpStrikeATR>0.0?InpStrikeATR:1.5);   // sync the S/D-strike proximity mirror used by ContextRun
+
+   //--- LIVE: startup summary so the running configuration is visible in the Experts log ---
+   bool _live=!MQLInfoInteger(MQL_TESTER);
+   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=f72-ownership-engine-v1",
+               (_live?"LIVE/DEMO":"STRATEGY TESTER"),_Symbol,EnumToString(_Period));
+   PrintFormat("    RISK   : mode=%s  risk=%.2f%%  maxLot=%.2f  maxTrades/day=%d",
+               (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay);
+   PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=NONE (ownership exits only)  trail=REMOVED  BE=REMOVED  partial=REMOVED",
+               InpMinSLAtr);
+   PrintFormat("    SLCAP  : max stop distance = %s",
+               (InpMaxSLPoints>0? IntegerToString(InpMaxSLPoints)+" points":"OFF (ATR cap only)"));
+   PrintFormat("    EXITS  : ownerTransfer=%s(%.0f%%)  termComplete=%s  p2Choch=%s(%d bars)  exhaustion=%s",
+               (InpExitOnOwnerTransfer?"on":"off"),InpOwnerTransferThresh,
+               (InpExitOnTermComplete?"on":"off"),
+               (InpExitOnP2CHOCH?"on":"off"),InpP2CHOCHConfirmBars,
+               (InpUseExhaustionExit?"on":"off"));
+   PrintFormat("    OWNGATE: %s  blockBuilding=%s  rangeStrict=%s  (v6 who-owns-price entry gate)",
+               (InpUseOwnershipGate?"ON":"OFF"),(InpOwnGateBlockBuilding?"y":"n"),(InpOwnGateRangeStrict?"y":"n"));
+   PrintFormat("    PROFGRD: %s  $%.0f/%.0f/%.0f/%.0f/%.0f -> %.0f/%.0f/%.0f/%.0f/%.0f%% off  BE@T1=%s  trail@T3+=%s",
+               (InpUseProfitGuard?"ON":"OFF"),
+               InpPG_Tier1USD,InpPG_Tier2USD,InpPG_Tier3USD,InpPG_Tier4USD,InpPG_Tier5USD,
+               InpPG_Tier1Close,InpPG_Tier2Close,InpPG_Tier3Close,InpPG_Tier4Close,InpPG_Tier5Close,
+               (InpPG_BEAtTier1?"y":"n"),(InpPG_TrailFromTier3?"y":"n"));
+   PrintFormat("    BACKSTOP: hard per-trade loss cap = %s",
+               (InpMaxLossPctBal>0.0? DoubleToString(InpMaxLossPctBal,1)+"%% of balance" : "OFF"));
+   PrintFormat("    SLIPGRD: entry no-chase cap=%s  sizingCushion=%dpts  fillLog=%s  deviation=%dpts  spreadGuard=%s",
+               (InpMaxEntrySlipPoints>0? IntegerToString(InpMaxEntrySlipPoints)+"pts":"OFF"),
+               InpSlippageBufPoints,(InpLogSlippage?"on":"off"),(int)InpDeviation,
+               (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
+   PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
+               (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
+               (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
+   if(_live && InpMaxSpreadPoints<=0)
+      Print("    WARNING: spread guard is OFF (InpMaxSpreadPoints=0). On live XAUUSD set it to reject news-spike spreads.");
+   if(_live && (InpRiskPercent>2.0 || InpMaxLot>5.0))
+      Print("    WARNING: risk settings are aggressive for live - confirm InpRiskPercent / InpMaxLot before running.");
+   if(InpSmallAccount)
+      PrintFormat("    SMALL-ACCT MODE ON: risk=%.2f%%  maxLot=%.2f  skipIfRisk>%.2f%%  maxTrades/day=%d",
+                  InpSmallAcctRiskPct,InpSmallAcctMaxLot,InpSmallAcctMaxRiskPct,InpSmallAcctMaxTrades);
+
    return(INIT_SUCCEEDED);
 }
 
@@ -3376,14 +3548,12 @@ void OnDeinit(const int reason){ Comment(""); }
 //==================================================================
 void DailyRollover()
 {
+   //--- SPEC AUDIT: daily loss halt REMOVED (external constraint, not curve logic).
+   //  Retain only the daily trade counter reset for max-trades-per-day entry guard. ---
    MqlDateTime dt; TimeToStruct(TimeCurrent(),dt);
    datetime dayKey=(datetime)(dt.year*10000+dt.mon*100+dt.day);
    if(dayKey!=gDayStamp){
-      gDayStamp=dayKey; gTradesToday=0; gHalted=false; gDayStartEquity=gAccount.Equity();
-   }
-   if(InpMaxDailyLossPct>0.0){
-      double dd=(gDayStartEquity-gAccount.Equity())/MathMax(gDayStartEquity,1.0)*100.0;
-      if(dd>=InpMaxDailyLossPct){ gHalted=true; }
+      gDayStamp=dayKey; gTradesToday=0;
    }
 }
 
@@ -3395,6 +3565,85 @@ bool SessionOK()
    if(InpSessStartHour<=InpSessEndHour)
       return(dt.hour>=InpSessStartHour && dt.hour<InpSessEndHour);
    return(dt.hour>=InpSessStartHour || dt.hour<InpSessEndHour);
+}
+
+//==================================================================
+// LIVE SAFETY HELPERS
+//==================================================================
+//--- is it currently safe to place a NEW order? (always true in the Strategy Tester) ---
+bool TradingEnabled()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return(true);                       // tester: never blocked
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))      return(false);   // no broker connection
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))  return(false);   // AutoTrading button off
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))            return(false);   // EA "Allow Algo Trading" off
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))    return(false);   // broker/account disallows trading
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))     return(false);   // broker disallows EAs
+   return(true);
+}
+//--- would this order leave enough free margin? (and is the account's margin level safe?) ---
+bool MarginOK(const int dir,const double lot,const double price)
+{
+   if(InpHaltOnLowMargin){
+      double mlvl=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);            // 0 when no positions are open
+      if(mlvl>0.0 && mlvl<200.0) return(false);                      // margin level below 200% -> too hot to add risk
+   }
+   double need=0.0;
+   ENUM_ORDER_TYPE ot=(dir==1?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
+   if(!OrderCalcMargin(ot,_Symbol,lot,price,need)) return(true);     // can't compute -> don't block
+   double freeM=AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double buffer=1.0-clamp(InpMarginBufferPct,0.0,90.0)/100.0;       // e.g. 5% -> may use up to 95% of free margin
+   return(need <= freeM*buffer);
+}
+
+//==================================================================
+// INCREMENT 1: OWNERSHIP / TRANSITION RESOLVER (read-only)
+//==================================================================
+//  Answers "which curve owns price, and is this BUILDING or the ENTRY CYCLE?" using the
+//  primitives the structure engine already produces per rung (recursion depth, dominance
+//  transfer %, compression) for the OWNER curve. It is SYMMETRIC by construction — the owner
+//  curve's direction (cur_ownerDir) supplies the side, so a high arms a SELL transition just
+//  like a low arms a BUY. It does NOT (yet) drive entries; it only publishes state for the panel
+//  so the read can be verified against the eye before it's allowed to trade.
+void ResolveOwnership()
+{
+   //--- compression sets how many recursive cycles to expect before the transfer completes ---
+   //  (your model: high compression -> many small/fast recursions; low compression -> one curve) ---
+   string r=cur_compRegime;
+   cur_recExpected = (r=="Extreme"?4 : r=="High"?3 : r=="Medium"?2 : 1);
+
+   //--- ownership split: the OWNER curve's own dominance transfer (symmetric, not netBias) ---
+   cur_newWaveOwn = clamp(cur_domTransfer,0.0,100.0);   // recursive wave that is taking control
+   cur_oldWaveOwn = 100.0 - cur_newWaveOwn;             // the dominant wave being displaced
+
+   //--- proximity sanity: the OWNER's distance to its HTF objective. The ctx_atFlip flag is
+   //  unreliable (it was reading TRUE at 41 ATR away while a runaway terminal-shift counter
+   //  spun to 20/4), so the resolver uses the measured ATR distance as the real proximity test. ---
+   bool atFlipReal = (InpUseV60Context ? ctx_atFlip : (cur_distFlipAtr<=2.0));
+   bool spring = (InpUseV60Context && ctx_failureSwing);
+   bool termDn = (InpUseV60Context && ctx_termComplete);
+
+   //--- transition complexity (Terminal only when ACTUALLY near the objective) ---
+   if(atFlipReal && (spring || termDn || (InpUseV60Context&&ctx_atFlip))) cur_transClass="Terminal";
+   else if(cur_recDepth>=3 || r=="Extreme")  cur_transClass="Complex";
+   else if(cur_recDepth==2 || r=="High")     cur_transClass="Moderate";
+   else                                      cur_transClass="Simple";
+
+   //--- the keystone verdict: BUILDING (first strike) vs ENTRY CYCLE (transition has BEGUN) ---
+   //  Spec Example 1 vs 2: a RAW first strike (recursion 0) = BUILDING -> wait. Once the recursive
+   //  transition has actually STARTED (>=InpEC_MinRecDepth recursions) AND the recursive wave is
+   //  gaining control (>=InpEC_MinNewOwn %), the entry cycle is ACTIVE -> act. We do NOT wait for
+   //  full 100% completion (that left us entering after the move). A fast spring / completed
+   //  terminal sequence still fast-tracks it. Thresholds are inputs so this is calibrated to the
+   //  chart, not guessed. ---
+   bool core     = (cur_newWaveOwn>=InpEC_MinNewOwn && cur_recDepth>=InpEC_MinRecDepth);
+   bool springOK = (spring && cur_recDepth>=1);                              // failure-swing / extreme compression compresses the recursion -> fast entry
+   bool termOK   = (termDn && atFlipReal);                                   // terminal sequence completed AT a genuine S/D strike
+   bool engOK    = (cur_entryReady=="Entry Active" && cur_newWaveOwn>=InpEC_MinNewOwn);
+   if( core || springOK || termOK || engOK )
+      cur_ownVerdict="ENTRY_CYCLE";
+   else
+      cur_ownVerdict="BUILDING";
 }
 
 //==================================================================
@@ -3413,6 +3662,8 @@ void ComputeEngine()
    ResetState();
    EngineRun(got,eaT,eaO,eaH,eaL,eaC,eaVol,MathMax(warmup,got-InpEngineBars));
    if(InpUseV60Context) ContextRun(InpEngineBars);   // v60 context (does not alter Letra cur_* decision)
+   ComputeARC();                                      // SYMPHONY ARC apex/value from the published leg
+   ResolveOwnership();                                // INCREMENT 1: publish who-owns-price / BUILDING-vs-ENTRY (read-only)
 }
 
 //==================================================================
@@ -3493,12 +3744,7 @@ double RecSizeMult()
    string r=cur_compRegime;
    return( r=="Extreme"?0.65 : r=="High"?0.80 : r=="Medium"?1.0 : 1.25 );  // Low compression = wide loops
 }
-double PartialFrac()
-{
-   if(!InpCompSizing || !InpUseV60Context) return(1.0);
-   string r=cur_compRegime;
-   return( r=="Extreme"?0.40 : r=="High"?0.55 : r=="Medium"?0.75 : 1.0 );  // compressed = bank partial sooner
-}
+//--- SPEC AUDIT: PartialFrac() removed (partial close logic deleted — campaigns run to completion).
 
 //--- protective stop just beyond the recent KEY swing high/low (real structure).
 //--- long  -> below the lowest low of the last InpSwingLookback closed bars
@@ -3550,34 +3796,103 @@ double ComputeSL(const int dir,const double entry)
    double maxD=InpMaxSLAtr*atr;
    if(dir==1  && sl<entry-maxD) sl=entry-maxD;
    if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
+   //--- HARD POINTS CAP: never further than InpMaxSLPoints from entry ---
+   if(InpMaxSLPoints>0){
+      double maxP=InpMaxSLPoints*_Point;
+      if(dir==1  && sl<entry-maxP) sl=entry-maxP;
+      if(dir==-1 && sl>entry+maxP) sl=entry+maxP;
+   }
+   return(NormPrice(sl));
+}
+
+//--- SYMPHONY-style STOP: the stop sits JUST beyond the ONE level whose break invalidates the
+//  trade = the curve's origin / anchor. We pick a SINGLE coherent level by priority (the level
+//  the entry keys off), side-validate it (so a wrong-side level can never be used - the old
+//  reversal bug), buffer it by a small ATR amount, and set it once. The recent swing is only a
+//  fallback when no origin level exists. ATR safety cap always applies.
+double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,const bool mtfEntry)
+{
+   double a=cur_atr; if(a<=0) a=10*_Point;
+   double buf=InpAnchorBufATR*a*gRecSizeMult;
+   double lvl=NA;
+   if(InpStructureStop){
+      if(mtfEntry && !naf(cur_mtfEntryInv))                                    lvl=cur_mtfEntryInv;   // owning rung invalidation (leg origin)
+      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))                  lvl=ctx_fuTip;         // FU wick extreme (curve origin)
+      else if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) lvl=ctx_lowestFlip;    // true S/D (lowest flip)
+      else if(!naf(cur_invActiveStop))                                         lvl=cur_invActiveStop; // engine structural invalidation
+      //--- side-validate: a level on the WRONG side of entry is discarded (never jam to min-dist) ---
+      if(!naf(lvl) && ((dir==1 && lvl>=entry) || (dir==-1 && lvl<=entry))) lvl=NA;
+   }
+   double sl;
+   if(!naf(lvl)) sl=lvl + (dir==1? -buf : buf);                                // stop JUST beyond the invalidation/origin
+   else {
+      double ks=KeyLevelStop(dir,entry);                                       // fallback: recent swing (side-safe), else engine/ATR
+      sl=(ks!=0.0)? ks : ComputeSL(dir,entry);
+   }
+   //--- minimum distance: broker-min AND a sane ATR floor. A structure level that sits CLOSER
+   //  than this means the entry is basically ON the level - a sub-ATR stop there just gets
+   //  picked off by normal gold-wick noise within a bar or two (the "opens and closes straight
+   //  away" bug), and the tiny risk also drags the RR-scaled TP into noise range. So the stop is
+   //  floored at InpMinSLAtr*ATR. gRecSizeMult lets a compressed/volatile curve run tighter
+   //  (~1 ATR in Extreme) while a wide curve gets ~1.9 ATR. The structure level is still used
+   //  whenever it sits FURTHER than this floor (the common case). ---
+   double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
+   if(dir==1  && sl>entry-minD) sl=entry-minD;
+   if(dir==-1 && sl<entry+minD) sl=entry+minD;
+   //--- ATR safety cap ---
+   double maxD=InpMaxSLAtr*a;
+   if(dir==1  && sl<entry-maxD) sl=entry-maxD;
+   if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
+   //--- HARD POINTS CAP: the stop can NEVER sit further than InpMaxSLPoints from entry
+   //  (caps per-trade risk regardless of structure/ATR; may place the stop INSIDE structure). ---
+   if(InpMaxSLPoints>0){
+      double maxP=InpMaxSLPoints*_Point;
+      if(dir==1  && sl<entry-maxP) sl=entry-maxP;
+      if(dir==-1 && sl>entry+maxP) sl=entry+maxP;
+   }
    return(NormPrice(sl));
 }
 
 double ComputeTP(const int dir,const double entry,const double sl)
 {
-   double atr=cur_atr; if(atr<=0) atr=10*_Point;
-   double risk=MathAbs(entry-sl);
-   double tp=0.0;
-   if(InpTPMode==TP_NETWORK){
-      // FU pool / Invisible-Network attractor — the magnet price is heading for
-      tp = !naf(ctx_netTarget)?ctx_netTarget : !naf(ctx_attractorPx)?ctx_attractorPx : entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-      //--- wide low-compression curve runs further -> project to the terminal (far FU flip) ---
-      if(InpCompSizing && InpUseV60Context && cur_compRegime=="Low"){
-         double far=(dir==1?ctx_fezHi:ctx_fezLo);
-         if(!naf(far) && ((dir==1&&far>tp)||(dir==-1&&far<tp))) tp=far;
-      }
-   } else if(InpTPMode==TP_ATR){
-      tp=entry+(dir==1? atr*InpTPAtrMult : -atr*InpTPAtrMult);
-   } else {
-      tp=entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
+   //--- SPEC AUDIT: ALL take-profit targets removed. Campaigns complete on ownership transfer /
+   //  terminal-sequence completion / P2 CHOCH — not on an arbitrary RR or price level.
+   //  Return 0 = no broker-side TP (the position lives until the engine closes it or SL hits). ---
+   return(0.0);
+}
+
+//--- SYMPHONY ENTRY MECHANISM (ported): the precise "WHEN". On the closed chart bar, require a
+//  momentum-delta inflection INTO the trade direction (the turn), at a measured retracement
+//  depth for continuation entries, with the inducement complete (not still inside the manip
+//  band). This converts F16's STATE-based entry into an EVENT-based one that lands on the curve.
+//  F16's context (entry-cycle gate) already decided WHETHER; this decides exactly WHEN. ---
+bool SymphonyTrigger(const int dir)
+{
+   if(!InpUseSymphonyTrigger) return(true);
+   int nb=(int)ArraySize(eaC);
+   if(nb<4) return(true);                              // not enough closed bars -> don't block (startup only)
+   int last=nb-2;                                      // last CLOSED chart bar
+   double d1=eaC[last]-eaC[last-1];                    // most-recent closed-bar delta
+   double d2=eaC[last-1]-eaC[last-2];                  // the delta before it
+   //--- 1) momentum inflection INTO the trade direction = the turn bar ---
+   if(InpRequireMomFlip)
+   {
+      bool flip=(dir==1)? (d1>=0.0 && d2<0.0) : (d1<=0.0 && d2>0.0);
+      if(!flip){ gEntryBlock="awaiting momentum flip (on-curve turn)"; return(false); }
    }
-   //--- validate side; fall back to RR if engine target is on the wrong side ---
-   if((dir==1 && tp<=entry) || (dir==-1 && tp>=entry))
-      tp=entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-   double minD=MinStopDist()+_Point;
-   if(dir==1  && tp<entry+minD) tp=entry+minD;
-   if(dir==-1 && tp>entry-minD) tp=entry-minD;
-   return(NormPrice(tp));
+   //--- 2) retracement band - CONTINUATION entries only (dir == live wave). Reversal/terminal
+   //       location is already handled by the at-flip + shift gate. ctx_retrX: 0 at the leg
+   //       extreme, 100 back at the invalidation/origin. ---
+   if(InpUseV60Context && ctx_waveDir==dir)
+   {
+      double r=ctx_retrX/100.0;
+      if(r<InpEntryRetrMin || r>InpEntryRetrMax)
+      { gEntryBlock="retrace "+DoubleToString(r,2)+" out of band ["+DoubleToString(InpEntryRetrMin,2)+"-"+DoubleToString(InpEntryRetrMax,2)+"]"; return(false); }
+   }
+   //--- 3) inducement complete: never enter while still inside the manipulation band ---
+   if(InpUseV60Context && ctx_inManipBand && !ctx_atTrueInduction)
+   { gEntryBlock="inducement not complete (in manip band)"; return(false); }
+   return(true);
 }
 
 void TryEnter()
@@ -3587,7 +3902,11 @@ void TryEnter()
    //--- PRIORITY: enter AT the fresh FU node (the indicator's extreme) ---
    if(dir==0 && InpUseV60Context && InpFUExtremeEntry && ctx_fuFresh && ctx_fuDir!=0){
       int cb=ConsensusBias();
-      if(InpFURequireBias && cb!=0 && ctx_fuDir!=cb){
+      //  SYMMETRIC reversal override: at a GENUINE S/D strike, an FU node that agrees with the
+      //  reversal side (bear FU at supply / bull FU at demand) is allowed even against the lagging
+      //  consensus bias - this is exactly the top-sell / bottom-buy the old bias veto suppressed.
+      bool _reversalOK = (ctx_atFlip && ctx_reversalSide!=0 && ctx_fuDir==ctx_reversalSide);
+      if(InpFURequireBias && cb!=0 && ctx_fuDir!=cb && !_reversalOK){
          gEntryBlock="FU "+(ctx_fuDir==1?"buy":"sell")+" node opposes "+(cb==1?"bull":"bear")+" bias";
       } else {
          dir=ctx_fuDir; aggressive=true; fuEntry=true;
@@ -3602,7 +3921,8 @@ void TryEnter()
       bool _okTrue  = (!InpRequireTrueInduction || !_ctx || ctx_atTrueInduction);
       bool _okFlip  = (!InpRequireAtFlip || !_ctx || ctx_atFlip);
       bool _okShift = (InpMinTermShifts<=0 || !_ctx || !ctx_atFlip || ctx_termShifts>=InpMinTermShifts || ctx_failureSwing);
-      bool _okOwner = (!InpOwnerMustAgree || !_ctx || cur_ownerDir==0 || cur_mtfEntryDir==cur_ownerDir);   // ownership-first: follow the owning curve
+      bool _okOwner = (!InpOwnerMustAgree || !_ctx || cur_ownerDir==0 || cur_mtfEntryDir==cur_ownerDir
+                       || cur_mtfEntryDom>=InpMinDomTransfer);   // a Return whose dominance has TRANSFERRED is the new curve -> trade the reversal (don't block it)
       if(cur_mtfEntryDom>=InpMinDomTransfer && cur_entryProb>=InpMinEntryProb && _okFlip && _okShift && _okManip && _okTrue && _okOwner){ dir=cur_mtfEntryDir; aggressive=true; mtfEntry=true; }
       else if(cur_mtfEntryDom<InpMinDomTransfer) gEntryBlock="first strike "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < entry cycle)";
       else if(!_okOwner) gEntryBlock=(cur_mtfEntryDir==1?"long":"short")+" vs owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":"bear");
@@ -3623,12 +3943,74 @@ void TryEnter()
       if(ok){ dir=adir; aggressive=true; }
    }
    if(dir==0){ gEntryBlock=(InpUseV60Context&&InpAggressiveEntry)?"no signal / v60 not aligned":"no signal (awaiting Return)"; return; }
-   //--- UNIFIED counter-bias veto: never trade against the dominant thesis (covers arrows, DOE, aggressive, FU).
-   //--- This is what stops shorts while "Bullish reversal developing" is on the panel. ---
-   if(InpBlockCounterBias){
+   //--- F72 entry-cycle context (computed ONCE, drives the vetoes + the gate below) --------
+   bool _ctxOn=InpUseV60Context;
+   bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
+   int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
+   bool _atFlipNow=(_ctxOn? ctx_atFlip : (cur_distFlipAtr<=2.0));   // ctx_atFlip is now a GENUINE S/D-node proximity (symmetric), so trust it
+   bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
+   bool _freshRet=(cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer);
+   //  TERMINAL entry = the NEW curve has taken control (dominance transferred / Entry Active /
+   //  at the flip with the shift sequence done / failure-swing). At that point we are MEANT to
+   //  trade the NEW curve even though the OLD owner/consensus still reads the prior direction -
+   //  that reversal IS the trade, so it must NOT be vetoed.
+   //  v6: the symmetric Ownership Resolver verdict is the authoritative "entry cycle has begun"
+   //  signal (works at tops AND bottoms, independent of the lagging netBias). ENTRY_CYCLE means
+   //  a recursive transition COMPLETED and a new wave took control - that legitimizes the entry
+   //  (including a reversal against the old owner), so it counts as a terminal entry. It is a
+   //  TIMING verdict; the trade DIRECTION is set by the trigger (FU/MTF/arrow), not by this.
+   bool _ownEntry = (cur_ownVerdict=="ENTRY_CYCLE");
+   bool _terminalEntry = (cur_entryReady=="Entry Active") || _freshRet
+                      || (_atFlipNow && _shiftsOK) || _fast || (_ctxOn && ctx_termComplete)
+                      || _ownEntry;
+   //  WITH-CURVE = aligned with the live owning curve (continuation - riding the dominant move).
+   bool _withCurve = (cur_ownerDir!=0 && dir==cur_ownerDir);
+
+   //--- counter-bias veto: blocks RANDOM counter-trend trades, but NEVER a confirmed terminal
+   //--- entry-cycle (that is exactly when we trade the new curve against the old consensus). ---
+   if(InpBlockCounterBias && !_terminalEntry){
       int cb=ConsensusBias();
       if(cb!=0 && dir!=cb){ gEntryBlock=(dir==1?"long":"short")+" vetoed vs "+(cb==1?"BULL":"BEAR")+" thesis"; return; }
    }
+   //--- F72 UNIFIED ENTRY-CYCLE GATE — trade WITH the curve -------------------------------
+   //  Allow the entry when it is either (a) aligned with the live OWNER curve (continuation),
+   //  or (b) a confirmed TERMINAL reversal where the new wave has taken control. Only a
+   //  counter-trend, mid-build entry (neither of those) is blocked. A trigger (arrow / DOE /
+   //  FU / fresh Return) is still required to reach here, so this does not over-trade.
+   if(InpRequireEntryCycle){
+      bool _cycleOK = _withCurve || _terminalEntry;
+      if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
+   }
+   //--- F72 v6 OWNERSHIP GATE — "which curve owns price, and is this BUILDING or the ENTRY CYCLE?"
+   //  The symmetric Ownership Resolver (ResolveOwnership) is the authoritative decision: it tracks
+   //  the recursive transition at the high/low and at the S/D zone (recursion depth + dominance
+   //  transfer + compression), independent of the lagging HTF bias. We only ACT once the recursive
+   //  wave has taken control (ENTRY_CYCLE); while still BUILDING (first strike / mid-negotiation)
+   //  we wait — this is what kills the range-top chop and stops boarding before the transition
+   //  completes. A fast Extreme-compression / failure-swing spring still bypasses (never miss it). ---
+   if(InpUseOwnershipGate){
+      bool _spring=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
+      bool _entryCycle=(cur_ownVerdict=="ENTRY_CYCLE");
+      //  (a) first-strike suppression (the keystone): do NOT enter while the owner curve is still
+      //  BUILDING — the recursive transition has not completed, so a trigger here is a first strike
+      //  into the zone (this is the range-top chop and the too-early breakout). Wait for the
+      //  transition to complete (ENTRY_CYCLE). A fast spring bypasses. This is a TIMING gate only;
+      //  direction is already set by the trigger above. ---
+      if(InpOwnGateBlockBuilding && !_entryCycle && !_spring){
+         gEntryBlock="BUILDING (first strike): owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)
+                    +"  new "+DoubleToString(cur_newWaveOwn,0)+"%  rec "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_recExpected)
+                    +" ("+cur_transClass+")";
+         return;
+      }
+      //  (b) rangebound: only take a terminal entry cycle at the range extreme, never mid-range ---
+      if(InpOwnGateRangeStrict && cur_tplSource=="RANGEBOUND" && cur_transClass!="Terminal" && !_spring){
+         gEntryBlock="rangebound: await terminal entry-cycle at the extreme (now "+cur_transClass+"/"+cur_ownVerdict+")";
+         return;
+      }
+   }
+   //--- SYMPHONY precise trigger: enter on the TURN (closed-bar momentum inflection at the right
+   //  retrace depth, inducement complete) - the "exactly WHEN" on top of the context "WHETHER". ---
+   if(!SymphonyTrigger(dir)) return;
    if(!aggressive){
       if(!PassesFilters(dir)) return;          // strict Letra path keeps full filters
    } else {
@@ -3637,58 +4019,37 @@ void TryEnter()
       if(cur_invInvalidated){ gEntryBlock="invalidated"; return; }
    }
    if(!SessionOK()){ gEntryBlock="session closed"; return; }
-   if(gHalted){ gEntryBlock="halted (daily loss)"; return; }
-   if(InpMaxTradesPerDay>0 && gTradesToday>=InpMaxTradesPerDay){ gEntryBlock="max trades/day"; return; }
+   int _maxTrades=(InpSmallAccount && InpSmallAcctMaxTrades>0)
+                  ? (InpMaxTradesPerDay>0? MathMin(InpMaxTradesPerDay,InpSmallAcctMaxTrades) : InpSmallAcctMaxTrades)
+                  : InpMaxTradesPerDay;
+   if(_maxTrades>0 && gTradesToday>=_maxTrades){ gEntryBlock="max trades/day"; return; }
    if(InpMaxSpreadPoints>0){ long sp=(long)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(sp>InpMaxSpreadPoints){ gEntryBlock="spread "+IntegerToString((int)sp); return; } }
 
    int ownDir=OwnPositionDir();
    if(ownDir!=0 && ownDir!=dir){
       if(OwnYoungerThan(InpMinHoldBars)){ gEntryBlock="hold (young pos, no flip)"; return; }   // don't flip a fresh trade
       if(InpReverseOnOpposite){ if(InpDebugExits) Print("=== FLIP  closing ",(ownDir==1?"BUY":"SELL")," to reverse into ",(dir==1?"BUY":"SELL"),"  (owner ",cur_curveOwner," ",f_waveDirLabel(cur_ownerDir),", thesis ",(ConsensusBias()==1?"BULL":ConsensusBias()==-1?"BEAR":"neutral"),")"); CloseOwnPositions(0); DeletePendingOrders(); }
-      else if(InpExitOnOpposite){ if(InpDebugExits) Print("=== EXIT  opposite-signal partial-flip: closing ",(ownDir==1?"BUY":"SELL")); CloseOwnPositions(-dir); }
       else { gEntryBlock="opposite pos open"; return; }
    }
    if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
    if(gMktClosed){ gEntryBlock="market closed (flip-close rejected)"; return; }   // a flip/opposite close was rejected because the market is shut -> do NOT open a fresh leg now
+   if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled / terminal not connected"; return; }
 
    sym.RefreshRates();
    double ask=sym.Ask(), bid=sym.Bid();
    double entry=(dir==1?ask:bid);
    gRecSizeMult=RecSizeMult();          // recursion-size-aware stop sizing (compression -> loop size)
-   double slBase;
-   if(fuEntry && !naf(ctx_fuTip)){
-      double a=cur_atr; if(a<=0) a=10*_Point;
-      slBase=(dir==1? ctx_fuTip - InpMinSLAtr*gRecSizeMult*a : ctx_fuTip + InpMinSLAtr*gRecSizeMult*a);   // stop BEYOND the FU wick extreme
-      //--- and push it beyond the recent key swing high/low (whichever protects more) ---
-      double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){
-         if(dir==1)  slBase=MathMin(slBase,ks);
-         else        slBase=MathMax(slBase,ks);
-      }
-      double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
-      if(dir==1 && slBase>entry-minD) slBase=entry-minD;
-      if(dir==-1&& slBase<entry+minD) slBase=entry+minD;
-      double maxD=InpMaxSLAtr*a;                                                // safety cap
-      if(dir==1 && slBase<entry-maxD) slBase=entry-maxD;
-      if(dir==-1&& slBase>entry+maxD) slBase=entry+maxD;
-      slBase=NormPrice(slBase);
-   } else slBase=ComputeSL(dir,entry);
-   //--- multi-TF entry: anchor the stop beyond THAT rung's invalidation (+ key swing) ---
-   if(mtfEntry && !naf(cur_mtfEntryInv)){
-      double a=cur_atr; if(a<=0) a=10*_Point;
-      double s2=cur_mtfEntryInv + (dir==1? -InpSLEngineBufATR*a : InpSLEngineBufATR*a);
-      double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){ if(dir==1) s2=MathMin(s2,ks); else s2=MathMax(s2,ks); }
-      double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
-      if(dir==1 && s2>entry-minD) s2=entry-minD;
-      if(dir==-1&& s2<entry+minD) s2=entry+minD;
-      double maxD=InpMaxSLAtr*a;
-      if(dir==1 && s2<entry-maxD) s2=entry-maxD;
-      if(dir==-1&& s2>entry+maxD) s2=entry+maxD;
-      slBase=NormPrice(s2);
-   }
+   double slBase=ComputeStructureSL(dir,entry,fuEntry,mtfEntry);   // F72: stop BEYOND the actual structure price is reacting off
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);
+   //--- LIVE: don't send an order the account can't safely afford ---
+   if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
+   //--- SMALL ACCOUNT: the broker minimum lot may force more risk than allowed (can't size smaller) -> skip ---
+   if(InpSmallAccount && InpSmallAcctMaxRiskPct>0.0){
+      double _riskMoney=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
+      double _riskPctActual=_riskMoney/MathMax(gAccount.Equity(),1.0)*100.0;
+      if(_riskPctActual>InpSmallAcctMaxRiskPct){ gEntryBlock="small-acct: min-lot risk "+DoubleToString(_riskPctActual,2)+"% > cap "+DoubleToString(InpSmallAcctMaxRiskPct,2)+"%"; return; }
+   }
    bool _arrow=(dir==1?cur_longSignal:cur_shortSignal);
    bool _doe=(dir==1?(cur_doeAction=="Long"):(cur_doeAction=="Short"));
    string _trig=fuEntry?"FU":mtfEntry?("MTF:"+cur_mtfEntryTF):aggressive?"V60AGG":(_arrow&&_doe)?"ARROW+DOE":_arrow?"ARROW":"DOE";
@@ -3697,7 +4058,7 @@ void TryEnter()
    bool ok=false;
    if(InpUseLimitEntry && !naf(cur_doeEntryMid)){
       double lim=NormPrice(cur_doeEntryMid);
-      double slL=ComputeSL(dir,lim);
+      double slL=ComputeStructureSL(dir,lim,fuEntry,mtfEntry);
       double tpL=ComputeTP(dir,lim,slL);
       double lotL=CalcLot(lim,slL);
       datetime exp=(InpPendingExpiryBars>0)?(TimeCurrent()+(datetime)(InpPendingExpiryBars*PeriodSeconds(_Period))):0;
@@ -3706,8 +4067,32 @@ void TryEnter()
       if(dir==1) ok=trade.BuyLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
       else       ok=trade.SellLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
    } else {
-      if(dir==1) ok=trade.Buy(lot,_Symbol,ask,slBase,tp,cmt);
-      else       ok=trade.Sell(lot,_Symbol,bid,slBase,tp,cmt);
+      //--- LIVE: market send with retry on TRANSIENT broker errors (requote / price changed /
+      //  off-quotes / timeout). Re-quote the price each attempt. Non-transient errors stop the loop. ---
+      int _tries=MathMax(1,InpOrderRetries);
+      for(int _a=0;_a<_tries && !ok;_a++){
+         sym.RefreshRates();
+         double _ask=sym.Ask(), _bid=sym.Bid();
+         //--- SLIPPAGE GUARD: don't CHASE a fast move. If the live price has run more than
+         //  InpMaxEntrySlipPoints away from the intended entry, abort instead of filling worse. ---
+         if(InpMaxEntrySlipPoints>0){
+            double _livePx=(dir==1?_ask:_bid);
+            double _slip=MathAbs(_livePx-entry)/_Point;
+            if(_slip>InpMaxEntrySlipPoints){
+               gEntryBlock="slippage guard: price moved "+DoubleToString(_slip,0)+"pts > "+IntegerToString(InpMaxEntrySlipPoints)+" (no chase)";
+               if(InpLogSlippage) Print("=== ENTRY ABORTED (slippage guard): intended ",DoubleToString(entry,_Digits)," live ",DoubleToString(_livePx,_Digits)," = ",DoubleToString(_slip,0),"pts > cap ",InpMaxEntrySlipPoints);
+               break;
+            }
+         }
+         ok=(dir==1)? trade.Buy(lot,_Symbol,_ask,slBase,tp,cmt)
+                    : trade.Sell(lot,_Symbol,_bid,slBase,tp,cmt);
+         if(ok) break;
+         uint _rc=trade.ResultRetcode();
+         bool _transient=(_rc==TRADE_RETCODE_REQUOTE||_rc==TRADE_RETCODE_PRICE_CHANGED||
+                          _rc==TRADE_RETCODE_PRICE_OFF||_rc==TRADE_RETCODE_TIMEOUT);
+         if(!_transient) break;                       // hard error -> stop (MktClosed() handles the closed-market case below)
+         if(InpRetryWaitMs>0 && !MQLInfoInteger(MQL_TESTER)) Sleep(InpRetryWaitMs);
+      }
    }
    if(!ok) MktClosed();   // if the entry was rejected because the market is shut, arm the back-off so the same-tick ManagePositions() does not also hammer the broker
    if(ok){
@@ -3725,6 +4110,7 @@ void TryEnter()
                " aggr=",(aggressive?"Y":"n"));
          Print("    OWNER   : ",cur_curveOwner," ",(cur_ownerDir==1?"Bull":cur_ownerDir==-1?"Bear":"Flat"),
                "  trans=",cur_transState,"  camp=",ctx_campaign,"  atFlip=",(ctx_atFlip?"Y":"n"),"  ready=",cur_entryReady);
+         Print("    OWNS    : ",cur_ownVerdict,"  [",cur_transClass,"]  new ",DoubleToString(cur_newWaveOwn,0),"% vs old ",DoubleToString(cur_oldWaveOwn,0),"%  rec ",IntegerToString(cur_recDepth),"/",IntegerToString(cur_recExpected),"  side ",f_waveDirLabel(cur_ownerDir));
          Print("    RECUR   : dom=",DoubleToString(cur_domTransfer,0),"%  comp=",cur_compRegime,
                "  depth=",cur_recDepth,"/",cur_expRecDepth,"  budget=",DoubleToString(cur_curveBudget,0),"%  toFlip=",DoubleToString(cur_distFlipAtr,1),"ATR  entryP=",DoubleToString(cur_entryProb,0),"%");
          Print("    TERMINAL: shifts=",ctx_termShifts,"/",ctx_termExpected,"  m1=",ctx_termM1Cycles,"  done=",(ctx_termComplete?"Y":"n"),
@@ -3740,25 +4126,16 @@ void TryEnter()
          if(pt==0) continue;
          if(PositionGetInteger(POSITION_MAGIC)==(long)InpMagic && PositionGetString(POSITION_SYMBOL)==_Symbol){
             double psl=PositionGetDouble(POSITION_SL);
+            //--- SLIPPAGE LOG: how far the actual fill was from the intended entry price ---
+            if(InpLogSlippage){
+               double _fillSlip=(PositionGetDouble(POSITION_PRICE_OPEN)-entry)/_Point;
+               Print("=== FILL slippage: intended ",DoubleToString(entry,_Digits)," filled ",DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN),_Digits)," = ",DoubleToString(_fillSlip,0),"pts (",(dir==1?"+adverse":"-favorable"),")");
+            }
             double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
             double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
-            double _minD =MinStopDist()+_Point;
-            double _tp1net=!naf(ctx_netTarget)?ctx_netTarget:ctx_attractorPx;   // FU/Network target for partial
-            //--- recursion-size-aware partial: bank sooner when compressed (move is quick) ---
-            if(!naf(_tp1net)){ double pf=PartialFrac(); _tp1net=_openP+(_tp1net-_openP)*pf; }
-            //--- VALIDATE the partial target: it MUST sit on the PROFIT side of entry by a
-            //    meaningful distance (>= broker min stop AND >= 0.20R).  Otherwise an
-            //    attractor that is behind / on top of price makes the 50% partial fire the
-            //    instant the trade opens (the "buy 2.5 close #x at the same timestamp as the
-            //    open" bug).  Fall back to a clean 1R partial; if even that is invalid, store
-            //    NA so the partial is simply disabled for this trade. ---
-            double _need=MathMax(_minD,0.20*_risk);
-            bool   _tp1ok=(!naf(_tp1net)) && (dir==1 ? _tp1net>=_openP+_need : _tp1net<=_openP-_need);
-            if(!_tp1ok){
-               double _fb=_openP+(dir==1? _risk : -_risk);                        // 1R fallback
-               _tp1net=(dir==1 ? (_fb>=_openP+_need?_fb:NA) : (_fb<=_openP-_need?_fb:NA));
-            }
-            MgRegister(pt,psl,_tp1net,dir);
+            //--- SPEC AUDIT: no TP1/partial registration. Register SL + ORIGINAL volume (for profit-guard scale-outs). ---
+            double _ovol=PositionGetDouble(POSITION_VOLUME);
+            MgRegister(pt,psl,NA,dir,_ovol);
             break;
          }
       }
@@ -3800,9 +4177,45 @@ bool MktClosed()
    }
    return false;
 }
+//--- ACCOUNT PROFIT GUARD: scale OUT so the cumulative closed volume reaches targetClosedPct of
+//  the ORIGINAL volume. Returns true if a partial close was performed (leaves >= 1 min-lot runner). ---
+bool ProfitGuardScaleTo(const ulong tk,const double origVol,const double curVol,const double targetClosedPct)
+{
+   if(origVol<=0.0 || curVol<=0.0) return(false);
+   double step  =SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+   double minlot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double remTarget=origVol*(1.0-targetClosedPct/100.0);     // volume to KEEP after this tier
+   double closeVol =curVol-remTarget;                        // volume to close now
+   closeVol=MathFloor(closeVol/step)*step;
+   if(closeVol<minlot) return(false);                        // nothing meaningful to close yet
+   if(curVol-closeVol<minlot){                               // keep at least a min-lot runner
+      closeVol=MathFloor((curVol-minlot)/step)*step;
+      if(closeVol<minlot) return(false);
+   }
+   if(trade.PositionClosePartial(tk,closeVol)) return(true);
+   MktClosed();
+   return(false);
+}
 void ManagePositions()
 {
-   if(gMktClosed) return;                 // market is closed -> skip all discretionary order actions until the next bar (server SL/TP still active)
+   if(gMktClosed) return;
+   //==================================================================
+   // F72 RECURSIVE CURVE OWNERSHIP ENGINE — CAMPAIGN MANAGEMENT
+   //==================================================================
+   // SPEC AUDIT: ALL artificial exits removed (TP/BE/trailing/session/thesis-flip/partial/
+   // life-score/narrative/phase-flip/opposite-signal). Recursive waves naturally contain
+   // pullbacks, internal liquidation, and ownership oscillation — these are NORMAL.
+   //
+   // EXIT ONLY on:
+   // 1) OWNERSHIP TRANSFER — the opposing curve now dominates (new curve > InpOwnerTransferThresh %)
+   // 2) TERMINAL SEQUENCE COMPLETION — the campaign's S/D transition completed (ctx_termComplete
+   //    AND the owner is no longer the trade direction AND transfer is confirmed)
+   // 3) PHASE-2 CHOCH AGAINST POSITION — internal structure proves campaign failure (an
+   //    opposite-direction CHoCH on the owner rung while the campaign is in Transition)
+   //
+   // The position lives until one of these triggers OR the structure SL (hard stop on the broker
+   // server, placed at the entry's actual invalidation). No price target, no time limit.
+   //==================================================================
    double atr=cur_atr; if(atr<=0) atr=10*_Point;
    for(int q=PositionsTotal()-1;q>=0;q--){
       ulong tk=PositionGetTicket(q);
@@ -3811,90 +4224,195 @@ void ManagePositions()
       int    dir   =PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1;
       double openP =PositionGetDouble(POSITION_PRICE_OPEN);
       double curSL =PositionGetDouble(POSITION_SL);
-      double curTP =PositionGetDouble(POSITION_TP);
-      double vol   =PositionGetDouble(POSITION_VOLUME);
       sym.RefreshRates();
       double mkt   =(dir==1?sym.Bid():sym.Ask());
       int    mi    =MgIndex(tk);
       double initSL=(mi>=0?gMgInitSL[mi]:curSL);
-      double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;   // unregistered/zero SL -> use ATR so BE & trailing still engage
+      double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;
       double rMult =(dir==1?(mkt-openP):(openP-mkt))/risk;
 
-      //--- bars this position has been open (gate discretionary exits) ---
+      //--- SAFETY NET: a position must NEVER run without a stop. If the SL is missing (0) for any
+      //  reason (e.g. a broker dropping SL/TP on a partial close), immediately re-apply a protective
+      //  stop — the break-even level if we've already locked, else the original structure stop. ---
+      if(curSL==0.0){
+         double wantSL=(mi>=0 && gMgBEDone[mi])
+                       ? NormPrice(openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point))
+                       : initSL;
+         if(wantSL>0.0 && ((dir==1&&wantSL<mkt)||(dir==-1&&wantSL>mkt))){
+            if(trade.PositionModify(tk,wantSL,0.0)){ DbgMod("SAFETY re-apply SL (was missing)",tk,dir,0.0,wantSL,mkt); curSL=wantSL; }
+            else if(MktClosed()) return;
+         }
+      }
+
+      //--- HARD LOSS BACKSTOP: force-close any position whose floating loss exceeds InpMaxLossPctBal
+      //  % of balance. This is the absolute catch-all for a naked/missing stop (the disappearing-SL
+      //  case) — even if the broker dropped the SL and the re-apply above failed, a position can
+      //  never lose more than this % of the account. Independent of all curve/ownership logic. ---
+      if(InpMaxLossPctBal>0.0){
+         double _bal=gAccount.Balance(); if(_bal<=0) _bal=gAccount.Equity();
+         double _flt=PositionGetDouble(POSITION_PROFIT);
+         if(_bal>0.0 && _flt < -(_bal*InpMaxLossPctBal/100.0)){
+            DbgExit("HARD LOSS BACKSTOP ("+DoubleToString(_flt/_bal*100.0,1)+"% of bal < -"+DoubleToString(InpMaxLossPctBal,1)+"%)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
+         }
+      }
+
+      //==================================================================
+      // ACCOUNT PROFIT GUARD (equity-protection overlay, runs BEFORE the hold gate)
+      //==================================================================
+      //  As floating profit ($) grows, lock and bank in 5 tiers (absolute account-currency):
+      //   T1 $1.5k -> SL to break-even + scale out to Tier1Close
+      //   T2 $2.5k -> scale out more
+      //   T3 $4k   -> scale out + start trailing the remainder
+      //   T4 $7k   -> scale out + trail
+      //   T5 $10k  -> scale out (100% = fully out / bank the move)
+      //  Tiers latch via gMgPGTier; a fast jump can fire several at once. Deliberate equity
+      //  choice that caps the biggest runners. Toggle InpUseProfitGuard to disable.
+      if(InpUseProfitGuard && mi>=0){
+         double floatP =PositionGetDouble(POSITION_PROFIT);              // this position's floating P/L ($)
+         double origVol=(gMgOrigVol[mi]>0.0 ? gMgOrigVol[mi] : PositionGetDouble(POSITION_VOLUME));
+         double trigUSD[5]; double closePc[5];
+         trigUSD[0]=InpPG_Tier1USD; trigUSD[1]=InpPG_Tier2USD; trigUSD[2]=InpPG_Tier3USD; trigUSD[3]=InpPG_Tier4USD; trigUSD[4]=InpPG_Tier5USD;
+         closePc[0]=InpPG_Tier1Close; closePc[1]=InpPG_Tier2Close; closePc[2]=InpPG_Tier3Close; closePc[3]=InpPG_Tier4Close; closePc[4]=InpPG_Tier5Close;
+         //--- advance through every tier the current profit has reached (handles a fast jump past several) ---
+         bool closedOut=false;
+         while(gMgPGTier[mi]<5 && floatP>=trigUSD[gMgPGTier[mi]]){
+            int t=gMgPGTier[mi];                                         // 0-based tier about to fire
+            double curVol=PositionGetDouble(POSITION_VOLUME);
+            if(ProfitGuardScaleTo(tk,origVol,curVol,closePc[t]))
+               DbgExit("PG T"+IntegerToString(t+1)+" scale-out ("+DoubleToString(closePc[t],0)+"% @ $"+DoubleToString(floatP,0)+")",tk,dir,openP,mkt,rMult);
+            //--- Tier 1: move SL to break-even AFTER the partial (broker may drop SL on partial -> re-read & re-assert) ---
+            if(t==0 && InpPG_BEAtTier1){
+               double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
+               double nowSL=PositionGetDouble(POSITION_SL);
+               bool improve=(dir==1?(be>nowSL):(nowSL==0||be<nowSL));
+               if(improve && ((dir==1&&be<mkt)||(dir==-1&&be>mkt))){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,nowSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
+               gMgBEDone[mi]=true;
+            }
+            gMgPGTier[mi]=t+1;
+            if(!posinfo.SelectByTicket(tk)){ closedOut=true; break; }    // T5 100% closed the whole position
+         }
+         if(closedOut) continue;                                        // position gone -> next position
+         //--- trail the remainder once Tier 3+ is active (re-read live SL; re-assert if a partial dropped it) ---
+         if(InpPG_TrailFromTier3 && gMgPGTier[mi]>=3){
+            double liveSL=PositionGetDouble(POSITION_SL);
+            double dist=atr*InpPG_TrailAtrMult; double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
+            double newSL=(dir==1? mkt-dist : mkt+dist); newSL=NormPrice(newSL);
+            if(dir==1 && newSL<openP) newSL=NormPrice(openP+InpPG_BEOffsetPoints*_Point);
+            if(dir==-1&& newSL>openP) newSL=NormPrice(openP-InpPG_BEOffsetPoints*_Point);
+            bool tImprove=(liveSL==0.0) || (dir==1?(newSL>liveSL):(newSL<liveSL));
+            if(tImprove && ((dir==1&&newSL<mkt)||(dir==-1&&newSL>mkt))){
+               if(trade.PositionModify(tk,newSL,0.0)){ DbgMod("PG trail",tk,dir,liveSL,newSL,mkt); curSL=newSL; } else if(MktClosed()) return;
+            }
+         }
+      }
+
+      //--- minimum hold gate: never exit on the entry bar (noise) ---
       int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
-      bool canSoftExit=(heldBars>=InpMinHoldBars);
-      //--- always-on protective exits (broker SL/TP also always active) ---
-      if(InpCloseAtSessEnd && !SessionOK()){ DbgExit("session-end",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      //--- discretionary exits: only after the minimum hold (stops cutting straight away) ---
-      //--- while the dominant thesis still backs this trade, HOLD through opposite blips ---
-      int  cbHold=ConsensusBias();
-      bool thesisSupports=(InpHoldWithThesis && cbHold!=0 && cbHold==dir);
-      //--- THESIS FLIP: the panel's bias has turned against this open trade -> close it
-      //--- (this is what removes a lingering short while the panel now reads "Bullish ...", and vice versa) ---
-      if(canSoftExit && InpExitOnThesisFlip && cbHold!=0 && cbHold!=dir){ DbgExit("thesis-flip (bias turned "+(cbHold==1?"BULL":"BEAR")+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      if(canSoftExit && !thesisSupports){
-         if(InpExitOnInvalid && cur_invInvalidated){ DbgExit("invalidated (active stop broken)",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         if(InpExitOnPhaseFlip && (cur_ie1aPhase=="Absorption"||cur_ie1aPhase=="Retracement")){ DbgExit("phase-flip ("+cur_ie1aPhase+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         if(InpExitOnOpposite && ((dir==1&&cur_shortSignal)||(dir==-1&&cur_longSignal))){ DbgExit("opposite signal printed",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      }
-      if(canSoftExit){
-         //--- v60 curve-life exit: close when the curve in our direction goes DEAD ---
-         if(InpUseV60Context && InpUseCurveLifeExit && ctx_life<=InpCurveDeadBelow && dir==ctx_waveDir){ DbgExit("curve-life dead (life "+DoubleToString(ctx_life,0)+"<="+IntegerToString((int)InpCurveDeadBelow)+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         //--- v60 narrative management: decayed chain -> exit; fading story -> lock to break-even ---
-         if(InpUseV60Context && InpUseNarrativeMgmt && dir==ctx_waveDir){
-            if(ctx_chainVitality<=InpChainExitBelow){ DbgExit("chain decayed (vit "+DoubleToString(ctx_chainVitality,0)+"<="+IntegerToString((int)InpChainExitBelow)+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-            if(ctx_narrState=="WEAKENING" && !ctx_converging){
-               double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-               bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
-               if(improve && trade.PositionModify(tk,be,curTP)){ DbgMod("narr-weakening->BE",tk,dir,curSL,be,mkt); if(mi>=0) gMgBEDone[mi]=true; curSL=be; }
-            }
+      if(heldBars<InpMinHoldBars) continue;
+
+      //--- EXIT 1: OWNERSHIP TRANSFER — the curve that owns price has fully transferred
+      //  to the opposing direction. This means the campaign we entered is no longer dominant;
+      //  a new campaign in the opposite direction has taken over. ---
+      if(InpExitOnOwnerTransfer){
+         bool ownerOpposed=(cur_ownerDir!=0 && cur_ownerDir!=dir);
+         bool domHigh=(cur_domTransfer>=InpOwnerTransferThresh);
+         if(ownerOpposed && domHigh){
+            DbgExit("ownership-transfer (owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+" dom "+DoubleToString(cur_domTransfer,0)+"%)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
       }
 
-      //--- partial close at TP1 ---
-      if(InpUsePartial && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
-         bool hit=(dir==1? mkt>=gMgTP1[mi] : mkt<=gMgTP1[mi]);
-         if(hit){
-            double closeVol=NormalizeLot(vol*InpPartialPct/100.0);
-            if(closeVol>0 && closeVol<vol){
-               if(trade.PositionClosePartial(tk,closeVol)){ gMgPartialDone[mi]=true;
-                  DbgExit("partial TP1 ("+IntegerToString((int)InpPartialPct)+"% @"+DoubleToString(gMgTP1[mi],_Digits)+")",tk,dir,openP,mkt,rMult);
-                  if(InpMoveBEAfterTP1){ double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-                     if((dir==1&&be>curSL)||(dir==-1&&(curSL==0||be<curSL))){ trade.PositionModify(tk,be,curTP); DbgMod("post-TP1->BE",tk,dir,curSL,be,mkt); } gMgBEDone[mi]=true; }
-               }
-               else if(MktClosed()) return;   // market shut at the TP1 touch -> stop retrying every tick (this was the #15 storm)
-            }
+      //--- EXIT 2: TERMINAL SEQUENCE COMPLETION — the campaign naturally reached its
+      //  supply/demand terminal and the transition is complete. The campaign is finished;
+      //  the ownership engine says the curve has delivered its full objective. ---
+      if(InpExitOnTermComplete){
+         bool termDone=(InpUseV60Context && ctx_termComplete);
+         //  Only fire this exit if the terminal sequence belongs to the OPPOSING campaign
+         //  (i.e., the ENTRY campaign's curve has been consumed and a new terminal against
+         //  it has matured). If the terminal is in OUR direction, it's our entry zone forming — hold.
+         bool termAgainstUs=(termDone && cur_ownerDir!=0 && cur_ownerDir!=dir);
+         if(termAgainstUs){
+            DbgExit("terminal-sequence-complete (campaign finished, owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+")",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
       }
 
-      //--- profit zone gate: BE + trailing only kick in after 3R OR 900 ticks (whichever first) ---
-      double profitPts =(dir==1?(mkt-openP):(openP-mkt))/_Point;
-      bool   inProfitZone=(rMult>=InpBETriggerRR || profitPts>=InpBETriggerPoints);
-
-      //--- break-even ---
-      if(InpUseBreakeven && inProfitZone && (mi<0||!gMgBEDone[mi])){
-         double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-         bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
-         if(improve && trade.PositionModify(tk,be,curTP)){ DbgMod("break-even (R "+DoubleToString(rMult,2)+")",tk,dir,curSL,be,mkt); if(mi>=0) gMgBEDone[mi]=true; curSL=be; }
-         else if(improve && MktClosed()) return;
-      }
-
-      //--- trailing (only once we're in the profit zone, so we never trail a fresh trade out) ---
-      if(InpUseTrailing && inProfitZone){
-         double dist=(InpTrailMode==TRAIL_ATR?atr*InpTrailAtrMult:InpTrailPoints*_Point);
-         double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
-         double newSL=(dir==1? mkt-dist : mkt+dist);
-         if(InpUseV60Context && InpUseMigrationTrail && ctx_cpState=="PERSISTING" && dir==ctx_waveDir && !naf(ctx_mig618)){
-            double m=ctx_mig618;
-            if((dir==1 && m<mkt) || (dir==-1 && m>mkt)) newSL=m;   // defend the migrated 0.618 band
+      //--- EXIT 3: PHASE-2 CHOCH AGAINST POSITION — internal structure has broken against
+      //  the campaign. This is a confirmed failure: the campaign tried to expand but the
+      //  opposing wave printed a CHoCH on the owner rung (or higher), proving the campaign
+      //  cannot hold. Requires confirmation bars to filter noise. ---
+      if(InpExitOnP2CHOCH){
+         //  A Phase-2 CHOCH = the owner curve's transition state is "BUILDING" or "EXPANSION"
+         //  (it tried to push in our direction) but the owner direction has FLIPPED against us.
+         //  The cur_transState being early ("BUILDING"/"EXPANSION") while the owner opposes us
+         //  means the structure just broke. Combined with sufficient bars, this is confirmed.
+         bool ownerFlipped=(cur_ownerDir!=0 && cur_ownerDir!=dir);
+         bool earlyTrans=(cur_transState=="BUILDING" || cur_transState=="EXPANSION");
+         //  Additional confirmation: the wave direction on the owner timeframe must also oppose.
+         bool waveConfirm=(ctx_waveDir!=0 && ctx_waveDir!=dir);
+         if(ownerFlipped && earlyTrans && waveConfirm && heldBars>=InpMinHoldBars+InpP2CHOCHConfirmBars){
+            DbgExit("P2-CHOCH-against (owner flipped to "+f_waveDirLabel(cur_ownerDir)+" trans="+cur_transState+", campaign failed)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
-         newSL=NormPrice(newSL);
-         double step=InpTrailStepPoints*_Point;
-         bool improve=(dir==1?(newSL>curSL+step):(curSL==0||newSL<curSL-step));
-         // never trail to the losing side of entry before BE
-         if(dir==1 && newSL<openP && !(mi>=0&&gMgBEDone[mi])) improve=improve&&false;
-         if(dir==-1&& newSL>openP && !(mi>=0&&gMgBEDone[mi])) improve=improve&&false;
-         if(improve){ if(trade.PositionModify(tk,newSL,curTP)) DbgMod((InpUseMigrationTrail&&ctx_cpState=="PERSISTING"?"trail-migration618":"trail"),tk,dir,curSL,newSL,mkt); else if(MktClosed()) return; }
+      }
+   }
+}
+
+//==================================================================
+// SYMPHONY COMPOSITE EXHAUSTION EXIT
+//==================================================================
+//--- Close ONLY when the move has objectively run its course - three independent confirmations
+//  must agree: (1) price reached the convex ARC apex region, (2) the curve/phase collapsed
+//  (the dominant wave flipped against the trade), (3) a sweep+reclaim rejection printed at the
+//  extreme (liquidity grab). This is "exit at terminal exhaustion" - it lets winners run to the
+//  curve apex instead of cutting early, but still banks before giving it all back. ---
+void ManageExhaustionExit()
+{
+   if(!InpUseExhaustionExit) return;
+   if(gMktClosed) return;
+   if(CountOwnPositions()<=0) return;
+   double a=cur_atr; if(a<=0) a=10*_Point;
+   int nb=(int)ArraySize(eaC);
+   if(nb<3) return;
+   int idx=nb-2, prv=nb-3;                 // last CLOSED bar + the one before
+   double hi=eaH[idx], lo=eaL[idx], cl=eaC[idx];
+   double mid=(hi+lo)*0.5;
+   sym.RefreshRates();
+   for(int q=PositionsTotal()-1;q>=0;q--)
+   {
+      ulong tk=PositionGetTicket(q); if(tk==0) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      int dir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1);
+      //--- GATE: this exit BANKS A WINNER at terminal exhaustion. It must NEVER fire on a fresh
+      //  or losing trade. A terminal-reversal entry is, by design, counter to the still-printing
+      //  wave at entry, so phaseCollapse (ctx_waveDir!=dir) is true the instant we open and the
+      //  entry's own sweep+reclaim can satisfy the sweep test -> without these gates the trade
+      //  was being closed on the entry bar (the "cut as soon as it opens" bug). ---
+      int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
+      if(heldBars<MathMax(InpMinHoldBars,1)) continue;          // give the move room first
+      double openP=PositionGetDouble(POSITION_PRICE_OPEN);
+      double px   =(dir==1?sym.Bid():sym.Ask());
+      bool   inProfit=(dir==1? px>openP : px<openP);
+      if(!inProfit) continue;                                   // only bank a move that ran our way
+      //--- 1) ARC exhaustion: price reached the convex apex region ---
+      bool arcHit=false;
+      if(!naf(ctx_arcApex) && ctx_arcDir==dir)
+         arcHit=(dir==1)? (hi>=ctx_arcApex-InpArcTolATR*a) : (lo<=ctx_arcApex+InpArcTolATR*a);
+      //--- 2) phase / curve collapse: the dominant wave has flipped against the trade ---
+      bool phaseCollapse=(ctx_waveDir!=0 && ctx_waveDir!=dir);
+      //--- 3) sweep + reclaim rejection at the extreme (institutional liquidity grab) ---
+      bool sweepReclaim=(dir==1)? (hi>eaH[prv] && cl<mid) : (lo<eaL[prv] && cl>mid);
+      if(arcHit && phaseCollapse && sweepReclaim)
+      {
+         if(InpDebugExits) Print("=== EXHAUSTION EXIT ",(dir==1?"BUY":"SELL")," #",tk,
+                                  "  arc=",DoubleToString(ctx_arcApex,_Digits),
+                                  "  waveDir=",ctx_waveDir,"  sweep+reclaim @",DoubleToString(cl,_Digits));
+         if(!trade.PositionClose(tk) && MktClosed()) return;
       }
    }
 }
@@ -3913,12 +4431,14 @@ void ShowStatus()
    s+="Opp    : "+cur_oppState+" "+R0(cur_oppProgress)+"%   ERF gate "+(cur_erfEntryGate?"OPEN":"SHUT")+"\n";
    s+="Stop   : "+PXs(cur_invActiveStop)+(cur_invInvalidated?" [INVALID]":"")+"   Target "+PXs(!naf(ctx_netTarget)?ctx_netTarget:ctx_attractorPx)+"\n";
    s+="Dest   : "+cur_tplWinnerClass+" "+PXs(cur_tplMainTarget)+" ("+cur_tplSource+")\n";
-   s+="Pos    : "+IntegerToString(CountOwnPositions())+"   TradesToday "+IntegerToString(gTradesToday)+(gHalted?"  [HALTED]":"")+"\n";
+   s+="Pos    : "+IntegerToString(CountOwnPositions())+"   TradesToday "+IntegerToString(gTradesToday)+"\n";
    s+="Gate   : "+gEntryBlock+"\n";
    s+="Curve  : own "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+"  "+cur_transState+"  ["+cur_entryReady+"]\n";
    s+="Recur  : dom "+R0(cur_domTransfer)+"%  comp "+cur_compRegime+"  depth "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth)+(cur_mtfEntryFresh?("  | RET "+cur_mtfEntryTF+" "+(cur_mtfEntryDir==1?"L":"S")+" dom "+R0(cur_mtfEntryDom)+"%"):"")+"\n";
+   s+="OWNS   : "+cur_ownVerdict+"  ["+cur_transClass+"]  new "+R0(cur_newWaveOwn)+"% vs old "+R0(cur_oldWaveOwn)+"%  rec "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_recExpected)+" ("+cur_compRegime+")  side "+f_waveDirLabel(cur_ownerDir)+"\n";
    s+="Cap    : budget "+R0(cur_curveBudget)+"%  toFlip "+DoubleToString(cur_distFlipAtr,1)+"ATR  entryP "+R0(cur_entryProb)+"%\n";
-   if(InpUseV60Context) s+="Camp   : "+ctx_campaign+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
+   s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"\n";
+   if(InpUseV60Context) s+="Camp   : "+ctx_campaign+(ctx_reversalSide!=0?(ctx_reversalSide==-1?"  STRUCK SUPPLY->hunt SELL":"  STRUCK DEMAND->hunt BUY"):"")+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
    if(InpUseV60Context) s+="Induc  : "+(ctx_failureSwing?"FAILURE SWING (spring) - ":"")+(ctx_atTrueInduction?"TRUE INDUCTION (lowest flip "+PXs(ctx_lowestFlip)+")":ctx_inManipBand?"MANIPULATION band 0.618-0.786 (wait)":"-")+"\n";
    s+="Narr   : "+cur_cmdNarrative;
    if(InpUseV60Context){
@@ -3950,9 +4470,10 @@ void OnTick()
       gMktClosed=false;          // new bar -> market may have reopened; re-allow management/flip order actions
       ComputeEngine();          // full recompute -> sets cur_* for last closed bar
       if(g_lastProcessed>=0){
+         ManageExhaustionExit(); // SYMPHONY composite terminal-exhaustion exit (closed-bar)
          TryEnter();             // evaluate entry on the just-closed bar
          if(InpDebugBlocks && StringFind(gEntryBlock,"ENTERED")<0 && gEntryBlock!="-" && gEntryBlock!="no signal (awaiting Return)")
-            Print("[no-entry] ",gEntryBlock,"   | owner ",cur_curveOwner," ",cur_transState," camp ",ctx_campaign," dom ",DoubleToString(cur_domTransfer,0),"%");
+            Print("[no-entry] ",gEntryBlock,"   | owner ",cur_curveOwner," ",cur_transState," camp ",ctx_campaign," dom ",DoubleToString(cur_domTransfer,0),"%  | OWNS ",cur_ownVerdict," [",cur_transClass,"] new ",DoubleToString(cur_newWaveOwn,0),"% rec ",IntegerToString(cur_recDepth),"/",IntegerToString(cur_recExpected));
          ManagePositions();      // re-manage with fresh engine state
          ShowStatus();
       }
