@@ -990,6 +990,14 @@ int    cur_expRecDepth=0;      // expected recursive cycles still possible (0..4
 double cur_transMaturity=0.0;  // transition maturity % (= dominance transfer)
 double cur_entryProb=0.0;      // entry-cycle probability %
 double cur_distFlipAtr=0.0;    // distance to HTF flip/objective in ATR
+//--- INCREMENT 1: Ownership / Transition Resolver outputs (read-only; "who owns price?") ---
+//  Symmetric (uses the OWNER curve's own dominance transfer / recursion / compression, NOT the
+//  lagging HTF netBias) so a top arms a SELL-side transition exactly like a bottom arms a BUY.
+string cur_transClass="-";     // Simple / Moderate / Complex / Terminal (transition complexity)
+int    cur_recExpected=1;      // recursions expected for this compression before transfer completes
+double cur_newWaveOwn=0.0;     // recursive (new) wave ownership %  (= dominance transfer)
+double cur_oldWaveOwn=100.0;   // dominant (old) wave ownership %   (= 100 - new)
+string cur_ownVerdict="BUILDING"; // BUILDING (first strike, still negotiating) / ENTRY_CYCLE (transfer complete, act)
 //--- prev-bar phase code per rung (persist across recomputes; NOT reset by ResetState) ---
 int    gPrevPhM1=-1,gPrevPhM3=-1,gPrevPhM5=-1,gPrevPhM15=-1,gPrevPhH1=-1,gPrevPhH4=-1;
 string cur_l0phase,cur_l1phase,cur_l2phase,cur_l3phase,cur_l4phase;
@@ -3552,6 +3560,47 @@ bool MarginOK(const int dir,const double lot,const double price)
 }
 
 //==================================================================
+// INCREMENT 1: OWNERSHIP / TRANSITION RESOLVER (read-only)
+//==================================================================
+//  Answers "which curve owns price, and is this BUILDING or the ENTRY CYCLE?" using the
+//  primitives the structure engine already produces per rung (recursion depth, dominance
+//  transfer %, compression) for the OWNER curve. It is SYMMETRIC by construction — the owner
+//  curve's direction (cur_ownerDir) supplies the side, so a high arms a SELL transition just
+//  like a low arms a BUY. It does NOT (yet) drive entries; it only publishes state for the panel
+//  so the read can be verified against the eye before it's allowed to trade.
+void ResolveOwnership()
+{
+   //--- compression sets how many recursive cycles to expect before the transfer completes ---
+   //  (your model: high compression -> many small/fast recursions; low compression -> one curve) ---
+   string r=cur_compRegime;
+   cur_recExpected = (r=="Extreme"?4 : r=="High"?3 : r=="Medium"?2 : 1);
+
+   //--- ownership split: the OWNER curve's own dominance transfer (symmetric, not netBias) ---
+   cur_newWaveOwn = clamp(cur_domTransfer,0.0,100.0);   // recursive wave that is taking control
+   cur_oldWaveOwn = 100.0 - cur_newWaveOwn;             // the dominant wave being displaced
+
+   //--- transition complexity ---
+   bool atFlip = (InpUseV60Context ? ctx_atFlip : (cur_distFlipAtr<=1.0));
+   bool spring = (InpUseV60Context && ctx_failureSwing);
+   bool termDn = (InpUseV60Context && ctx_termComplete);
+   if(atFlip || spring || termDn)            cur_transClass="Terminal";   // at the HTF flip / spring = terminal area
+   else if(cur_recDepth>=3 || r=="Extreme")  cur_transClass="Complex";    // many recursions
+   else if(cur_recDepth==2 || r=="High")     cur_transClass="Moderate";
+   else                                      cur_transClass="Simple";     // one curve / low compression
+
+   //--- the keystone verdict: BUILDING (first strike) vs ENTRY CYCLE (transfer complete) ---
+   //  Entry cycle = the recursive wave has taken control (>=55%) AND enough recursions for the
+   //  compression have printed, OR a terminal spring / completed terminal sequence (fast entry),
+   //  OR the engine already reads "Entry Active". Otherwise we are still BUILDING -> wait.
+   bool transfer  = (cur_newWaveOwn>=55.0);
+   bool enoughRec = (cur_recDepth>=cur_recExpected);
+   if( (transfer && enoughRec) || spring || termDn || cur_entryReady=="Entry Active" )
+      cur_ownVerdict="ENTRY_CYCLE";
+   else
+      cur_ownVerdict="BUILDING";
+}
+
+//==================================================================
 // ENGINE COMPUTE (full recompute over window each new bar)
 //==================================================================
 void ComputeEngine()
@@ -3568,6 +3617,7 @@ void ComputeEngine()
    EngineRun(got,eaT,eaO,eaH,eaL,eaC,eaVol,MathMax(warmup,got-InpEngineBars));
    if(InpUseV60Context) ContextRun(InpEngineBars);   // v60 context (does not alter Letra cur_* decision)
    ComputeARC();                                      // SYMPHONY ARC apex/value from the published leg
+   ResolveOwnership();                                // INCREMENT 1: publish who-owns-price / BUILDING-vs-ENTRY (read-only)
 }
 
 //==================================================================
@@ -4300,6 +4350,7 @@ void ShowStatus()
    s+="Gate   : "+gEntryBlock+"\n";
    s+="Curve  : own "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+"  "+cur_transState+"  ["+cur_entryReady+"]\n";
    s+="Recur  : dom "+R0(cur_domTransfer)+"%  comp "+cur_compRegime+"  depth "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth)+(cur_mtfEntryFresh?("  | RET "+cur_mtfEntryTF+" "+(cur_mtfEntryDir==1?"L":"S")+" dom "+R0(cur_mtfEntryDom)+"%"):"")+"\n";
+   s+="OWNS   : "+cur_ownVerdict+"  ["+cur_transClass+"]  new "+R0(cur_newWaveOwn)+"% vs old "+R0(cur_oldWaveOwn)+"%  rec "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_recExpected)+" ("+cur_compRegime+")  side "+f_waveDirLabel(cur_ownerDir)+"\n";
    s+="Cap    : budget "+R0(cur_curveBudget)+"%  toFlip "+DoubleToString(cur_distFlipAtr,1)+"ATR  entryP "+R0(cur_entryProb)+"%\n";
    s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"\n";
    if(InpUseV60Context) s+="Camp   : "+ctx_campaign+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
@@ -4337,7 +4388,7 @@ void OnTick()
          ManageExhaustionExit(); // SYMPHONY composite terminal-exhaustion exit (closed-bar)
          TryEnter();             // evaluate entry on the just-closed bar
          if(InpDebugBlocks && StringFind(gEntryBlock,"ENTERED")<0 && gEntryBlock!="-" && gEntryBlock!="no signal (awaiting Return)")
-            Print("[no-entry] ",gEntryBlock,"   | owner ",cur_curveOwner," ",cur_transState," camp ",ctx_campaign," dom ",DoubleToString(cur_domTransfer,0),"%");
+            Print("[no-entry] ",gEntryBlock,"   | owner ",cur_curveOwner," ",cur_transState," camp ",ctx_campaign," dom ",DoubleToString(cur_domTransfer,0),"%  | OWNS ",cur_ownVerdict," [",cur_transClass,"] new ",DoubleToString(cur_newWaveOwn,0),"% rec ",IntegerToString(cur_recDepth),"/",IntegerToString(cur_recExpected));
          ManagePositions();      // re-manage with fresh engine state
          ShowStatus();
       }
