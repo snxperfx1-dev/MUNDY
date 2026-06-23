@@ -2755,6 +2755,7 @@ double ctx_narrative=50.0; string ctx_narrState="HOLDING"; bool ctx_converging=f
 double ctx_chainVitality=50.0, ctx_mig50=NA, ctx_mig618=NA, ctx_retrX=50.0;
 //--- F72 campaign ownership: building (expansion -> flip) vs terminal (at the HTF FU flip zone) ---
 bool   ctx_atFlip=false;          // price has reached / is inside the HTF FU flip zone
+int    ctx_reversalSide=0;        // SYMMETRIC strike side: -1 = struck SUPPLY (hunt SELL), +1 = struck DEMAND (hunt BUY), 0 = not at a zone
 string ctx_campaign="EXPANSION";  // EXPANSION (building) / TERMINAL (at flip)
 double ctx_distFlipAtr=0.0;       // distance to the flip magnet in ATR
 bool   ctx_fuMerged=false;        // recursive curve respected the parent FU -> camp merged back (Principle 9)
@@ -3027,10 +3028,26 @@ void ContextRun(const int bars)
    //  reached the FU flip zone, where induction/liquidation/entry-cycle happens.
    //  The FU flip zone is already mapped (network attractor / FEZ corridor).
    double _flipMag = !naf(attractorPx)?attractorPx : nz(netTarget,c_tgt);
-   bool   _inFez   = (!naf(fezHi)&&!naf(fezLo)&&clL<=fezHi&&clL>=fezLo);
-   double _distMag = (!naf(_flipMag))?MathAbs(clL-_flipMag):NA;
-   ctx_distFlipAtr = (!naf(_distMag)&&atrL>0)?_distMag/atrL : 5.0;
-   ctx_atFlip   = _inFez || (!naf(_distMag) && _distMag<=atrL*1.0);
+   //  SYMMETRIC S/D STRIKE: fezHi = strongest SUPPLY node above price, fezLo = strongest DEMAND
+   //  node below (both already found regardless of bias). "At flip" = price has actually REACHED
+   //  one of them (within 1 ATR) - a genuine strike into HTF supply (-> hunt SELL) or demand
+   //  (-> hunt BUY). Replaces the old loose "between two nodes" test that misfired (atFlip=Y at
+   //  41 ATR) and the bias-locked one-sided detection that could only see one direction. ---
+   double _distSup = (!naf(fezHi))? MathAbs(clL-fezHi) : NA;   // distance to supply above
+   double _distDem = (!naf(fezLo))? MathAbs(clL-fezLo) : NA;   // distance to demand below
+   bool   _strikeSup = (!naf(_distSup) && atrL>0 && _distSup<=atrL*1.0);
+   bool   _strikeDem = (!naf(_distDem) && atrL>0 && _distDem<=atrL*1.0);
+   double _nearDist = NA;
+   if(!naf(_distSup) && !naf(_distDem)) _nearDist=fmin2(_distSup,_distDem);
+   else if(!naf(_distSup))              _nearDist=_distSup;
+   else if(!naf(_distDem))              _nearDist=_distDem;
+   ctx_distFlipAtr = (!naf(_nearDist)&&atrL>0)? _nearDist/atrL : 5.0;
+   ctx_atFlip   = _strikeSup || _strikeDem;                    // genuine proximity to a real S/D node
+   //  reversal side at the strike: supply -> SELL (-1), demand -> BUY (+1); nearer node wins if pinched
+   if(_strikeSup && _strikeDem) ctx_reversalSide = (_distSup<=_distDem? -1 : 1);
+   else if(_strikeSup)          ctx_reversalSide = -1;
+   else if(_strikeDem)          ctx_reversalSide = 1;
+   else                         ctx_reversalSide = 0;
    ctx_campaign = ctx_atFlip ? "TERMINAL (at flip)" : "EXPANSION (building)";
    //  Principle 9 — FU camp merge: a fresh FU node that sits at the SAME flip zone as
    //  the network attractor means the recursive curve respected the parent FU, so the
@@ -3052,19 +3069,25 @@ void ContextRun(const int bars)
    //  terminal completes when M5 shifts reach the expected count, OR (on a larger-TF owner where
    //  the terminal only nests on M1) when the M1 sub-cycles reach ~2x the expected.
    bool _htfOwner=(cur_curveOwner=="H1"||cur_curveOwner=="H4"||cur_curveOwner=="M15");
-   ctx_termComplete=(ctx_atFlip && (g_termShifts>=_expShifts || (_htfOwner && ctx_termM1Cycles>=2*_expShifts)));
+   //  RUNAWAY GUARD: a clean terminal completes and price LEAVES the zone. If shifts pile up far
+   //  beyond expected, price is RANGING at the node (chop) - that is NOT a completed terminal, and
+   //  the counter is re-armed so a fresh sequence can be recognised (this was the shifts=20/4,
+   //  done=Y false positive that forced a bad ENTRY_CYCLE). ---
+   if(ctx_atFlip && g_termShifts>3*_expShifts){ g_termActive=false; g_termShifts=0; ctx_termM1Cycles=0; ctx_termShifts=0; }
+   ctx_termComplete = ctx_atFlip && (
+        (g_termShifts>=_expShifts && g_termShifts<=3*_expShifts)
+     || (_htfOwner && ctx_termM1Cycles>=2*_expShifts && ctx_termM1Cycles<=6*_expShifts) );
 
-   //  Part 3 — manipulation band vs true induction. The 0.618/0.70/0.786 fib band of the
-   //  owner leg is where participants manipulate (displacement, NOT the entry). True induction
-   //  happens at the LOWEST flip (deepest demand / highest supply = true S/D). Entries align
-   //  to the true flip, not the manipulation wicks.
-   ctx_lowestFlip = lowFlipPx;
-   ctx_atTrueInduction = (!naf(lowFlipPx) && atrL>0 && MathAbs(clL-lowFlipPx)<=atrL*0.75);
-   //  failure swing (spring): in High/Extreme compression price sweeps BEYOND the true flip
-   //  then reclaims it on the close - that IS the terminal spring, entry comes fast.
+   //  Part 3 — manipulation band vs true induction. True induction = price is AT the STRUCK S/D
+   //  node (supply if the reversal is SELL, demand if BUY) — symmetric, not bias-locked. ---
+   double _struckNode = (ctx_reversalSide==-1? fezHi : ctx_reversalSide==1? fezLo : lowFlipPx);
+   ctx_lowestFlip = _struckNode;
+   ctx_atTrueInduction = (!naf(_struckNode) && atrL>0 && MathAbs(clL-_struckNode)<=atrL*0.75);
+   //  failure swing (spring), SYMMETRIC: at SUPPLY sweep ABOVE then reclaim below = bearish spring;
+   //  at DEMAND sweep BELOW then reclaim above = bullish spring. High/Extreme compression only. ---
    bool _comp=(cur_compRegime=="High"||cur_compRegime=="Extreme");
-   bool _fsL=(!naf(lowFlipPx)&&netBias>=0&&d.l[last]<lowFlipPx&&clL>lowFlipPx);
-   bool _fsS=(!naf(lowFlipPx)&&netBias<=0&&d.h[last]>lowFlipPx&&clL<lowFlipPx);
+   bool _fsS=(ctx_reversalSide==-1 && !naf(fezHi) && d.h[last]>fezHi && clL<fezHi);  // bearish spring at supply
+   bool _fsL=(ctx_reversalSide==1  && !naf(fezLo) && d.l[last]<fezLo && clL>fezLo);  // bullish spring at demand
    ctx_failureSwing=(ctx_atFlip && _comp && (_fsL||_fsS));
    ctx_inManipBand = false;
    if(!naf(cExtreme) && !naf(c_inv) && cExtreme!=c_inv){
@@ -3589,7 +3612,7 @@ void ResolveOwnership()
    //--- proximity sanity: the OWNER's distance to its HTF objective. The ctx_atFlip flag is
    //  unreliable (it was reading TRUE at 41 ATR away while a runaway terminal-shift counter
    //  spun to 20/4), so the resolver uses the measured ATR distance as the real proximity test. ---
-   bool atFlipReal = (cur_distFlipAtr<=2.0);
+   bool atFlipReal = (InpUseV60Context ? ctx_atFlip : (cur_distFlipAtr<=2.0));
    bool spring = (InpUseV60Context && ctx_failureSwing);
    bool termDn = (InpUseV60Context && ctx_termComplete);
 
@@ -3871,7 +3894,11 @@ void TryEnter()
    //--- PRIORITY: enter AT the fresh FU node (the indicator's extreme) ---
    if(dir==0 && InpUseV60Context && InpFUExtremeEntry && ctx_fuFresh && ctx_fuDir!=0){
       int cb=ConsensusBias();
-      if(InpFURequireBias && cb!=0 && ctx_fuDir!=cb){
+      //  SYMMETRIC reversal override: at a GENUINE S/D strike, an FU node that agrees with the
+      //  reversal side (bear FU at supply / bull FU at demand) is allowed even against the lagging
+      //  consensus bias - this is exactly the top-sell / bottom-buy the old bias veto suppressed.
+      bool _reversalOK = (ctx_atFlip && ctx_reversalSide!=0 && ctx_fuDir==ctx_reversalSide);
+      if(InpFURequireBias && cb!=0 && ctx_fuDir!=cb && !_reversalOK){
          gEntryBlock="FU "+(ctx_fuDir==1?"buy":"sell")+" node opposes "+(cb==1?"bull":"bear")+" bias";
       } else {
          dir=ctx_fuDir; aggressive=true; fuEntry=true;
@@ -3912,7 +3939,7 @@ void TryEnter()
    bool _ctxOn=InpUseV60Context;
    bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
    int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
-   bool _atFlipNow=((_ctxOn?ctx_atFlip:true) && cur_distFlipAtr<=2.0);   // require REAL proximity: ctx_atFlip alone misfired (TRUE at 41 ATR) and let the runaway shift counter qualify a terminal
+   bool _atFlipNow=(_ctxOn? ctx_atFlip : (cur_distFlipAtr<=2.0));   // ctx_atFlip is now a GENUINE S/D-node proximity (symmetric), so trust it
    bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
    bool _freshRet=(cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer);
    //  TERMINAL entry = the NEW curve has taken control (dominance transferred / Entry Active /
@@ -4403,7 +4430,7 @@ void ShowStatus()
    s+="OWNS   : "+cur_ownVerdict+"  ["+cur_transClass+"]  new "+R0(cur_newWaveOwn)+"% vs old "+R0(cur_oldWaveOwn)+"%  rec "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_recExpected)+" ("+cur_compRegime+")  side "+f_waveDirLabel(cur_ownerDir)+"\n";
    s+="Cap    : budget "+R0(cur_curveBudget)+"%  toFlip "+DoubleToString(cur_distFlipAtr,1)+"ATR  entryP "+R0(cur_entryProb)+"%\n";
    s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"\n";
-   if(InpUseV60Context) s+="Camp   : "+ctx_campaign+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
+   if(InpUseV60Context) s+="Camp   : "+ctx_campaign+(ctx_reversalSide!=0?(ctx_reversalSide==-1?"  STRUCK SUPPLY->hunt SELL":"  STRUCK DEMAND->hunt BUY"):"")+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
    if(InpUseV60Context) s+="Induc  : "+(ctx_failureSwing?"FAILURE SWING (spring) - ":"")+(ctx_atTrueInduction?"TRUE INDUCTION (lowest flip "+PXs(ctx_lowestFlip)+")":ctx_inManipBand?"MANIPULATION band 0.618-0.786 (wait)":"-")+"\n";
    s+="Narr   : "+cur_cmdNarrative;
    if(InpUseV60Context){
