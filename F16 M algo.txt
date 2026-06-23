@@ -3118,6 +3118,13 @@ input double        InpRiskPercent      = 1.0;          // Risk % of equity (LOT
 input double        InpMaxLot           = 2.0;          // Hard lot cap (reduced from 5: 5 lots/100k was ~3-5% risk/trade -> 96% DD)
 input int           InpMaxSpreadPoints  = 0;            // Max spread (points); 0=off (gold spreads are large!)
 
+input group "Letra37 EA - Small Account Mode (toggle)"
+input bool          InpSmallAccount       = false;      // TOGGLE: apply small-account sizing/limits below (overrides risk% + lot cap)
+input double        InpSmallAcctRiskPct   = 0.5;        // Small-acct: risk % per trade (lower than the standard InpRiskPercent)
+input double        InpSmallAcctMaxLot    = 0.10;       // Small-acct: hard lot cap (micro sizing)
+input double        InpSmallAcctMaxRiskPct= 2.0;        // Small-acct: SKIP a trade if even the broker-minimum lot would risk more than this % (can't size smaller)
+input int           InpSmallAcctMaxTrades = 5;          // Small-acct: max new trades/day (0=use the standard limit)
+
 input group "Letra37 EA - Stop Loss"
 input ENUM_SL_MODE  InpSLMode           = SL_ENGINE;    // Stop-loss source
 input double        InpSLAtrMult        = 1.5;          // SL = ATR * mult (SL_ATR)
@@ -3289,7 +3296,8 @@ double NormalizeLot(double lot)
    lot=MathFloor(lot/step)*step;
    if(lot<minlot) lot=minlot;
    if(lot>maxlot) lot=maxlot;
-   if(lot>InpMaxLot) lot=InpMaxLot;
+   double cap=(InpSmallAccount? MathMin(InpMaxLot,InpSmallAcctMaxLot) : InpMaxLot);
+   if(lot>cap) lot=cap;
    return(lot);
 }
 
@@ -3304,7 +3312,8 @@ double MoneyPerPointPerLot()
 double CalcLot(const double entry,const double sl)
 {
    if(InpLotMode==LOT_FIXED) return(NormalizeLot(InpFixedLot));
-   double riskMoney=gAccount.Equity()*InpRiskPercent/100.0;   // pure risk-% sizing (no vol-scaling / RD throttle)
+   double riskPct=(InpSmallAccount? InpSmallAcctRiskPct : InpRiskPercent);   // small-account mode uses its own (lower) risk %
+   double riskMoney=gAccount.Equity()*riskPct/100.0;
    double slPts=MathAbs(entry-sl)/_Point;
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
@@ -3438,6 +3447,9 @@ int OnInit()
       Print("    WARNING: spread guard is OFF (InpMaxSpreadPoints=0). On live XAUUSD set it to reject news-spike spreads.");
    if(_live && (InpRiskPercent>2.0 || InpMaxLot>5.0))
       Print("    WARNING: risk settings are aggressive for live - confirm InpRiskPercent / InpMaxLot before running.");
+   if(InpSmallAccount)
+      PrintFormat("    SMALL-ACCT MODE ON: risk=%.2f%%  maxLot=%.2f  skipIfRisk>%.2f%%  maxTrades/day=%d",
+                  InpSmallAcctRiskPct,InpSmallAcctMaxLot,InpSmallAcctMaxRiskPct,InpSmallAcctMaxTrades);
 
    return(INIT_SUCCEEDED);
 }
@@ -3854,7 +3866,10 @@ void TryEnter()
    }
    if(!SessionOK()){ gEntryBlock="session closed"; return; }
    if(gHalted){ gEntryBlock="halted (daily loss)"; return; }
-   if(InpMaxTradesPerDay>0 && gTradesToday>=InpMaxTradesPerDay){ gEntryBlock="max trades/day"; return; }
+   int _maxTrades=(InpSmallAccount && InpSmallAcctMaxTrades>0)
+                  ? (InpMaxTradesPerDay>0? MathMin(InpMaxTradesPerDay,InpSmallAcctMaxTrades) : InpSmallAcctMaxTrades)
+                  : InpMaxTradesPerDay;
+   if(_maxTrades>0 && gTradesToday>=_maxTrades){ gEntryBlock="max trades/day"; return; }
    if(InpMaxSpreadPoints>0){ long sp=(long)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(sp>InpMaxSpreadPoints){ gEntryBlock="spread "+IntegerToString((int)sp); return; } }
 
    int ownDir=OwnPositionDir();
@@ -3883,6 +3898,12 @@ void TryEnter()
    }
    //--- LIVE: don't send an order the account can't safely afford ---
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
+   //--- SMALL ACCOUNT: the broker minimum lot may force more risk than allowed (can't size smaller) -> skip ---
+   if(InpSmallAccount && InpSmallAcctMaxRiskPct>0.0){
+      double _riskMoney=(MathAbs(entry-slBase)/_Point)*MoneyPerPointPerLot()*lot;
+      double _riskPctActual=_riskMoney/MathMax(gAccount.Equity(),1.0)*100.0;
+      if(_riskPctActual>InpSmallAcctMaxRiskPct){ gEntryBlock="small-acct: min-lot risk "+DoubleToString(_riskPctActual,2)+"% > cap "+DoubleToString(InpSmallAcctMaxRiskPct,2)+"%"; return; }
+   }
    bool _arrow=(dir==1?cur_longSignal:cur_shortSignal);
    bool _doe=(dir==1?(cur_doeAction=="Long"):(cur_doeAction=="Short"));
    string _trig=fuEntry?"FU":mtfEntry?("MTF:"+cur_mtfEntryTF):aggressive?"V60AGG":(_arrow&&_doe)?"ARROW+DOE":_arrow?"ARROW":"DOE";
