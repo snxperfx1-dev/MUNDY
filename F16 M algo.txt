@@ -3173,6 +3173,13 @@ input bool          InpDebugEntries     = true;         // Print full entry reas
 input bool          InpDebugBlocks      = false;        // Also log why entries are BLOCKED (verbose - maps near-misses)
 input bool          InpDebugExits       = true;         // Print why each trade was CLOSED / its stop moved (maps early-exit & stop problems)
 
+input group "Letra37 EA - Live Safety"
+input bool   InpVerifyTradeAllowed = true;  // LIVE: only place NEW orders when the terminal is connected and algo-trading is permitted (terminal + account + EA)
+input int    InpOrderRetries       = 3;     // LIVE: retry a market order this many times on a TRANSIENT broker error (requote / price changed / off-quotes / timeout)
+input int    InpRetryWaitMs        = 200;   // LIVE: wait between order retries (ms)
+input double InpMarginBufferPct    = 5.0;   // LIVE: keep this % of free margin unused - block a new entry that would consume more
+input bool   InpHaltOnLowMargin    = true;  // LIVE: block new entries when the margin level is unsafe
+
 input group "Letra37 EA - v60 Context Filters"
 input bool   InpUseV60Context   = true;    // Compute v60 context (network / curve-life / TIE / narrative)
 input bool   InpReqNetAgree     = true;    // Require Invisible-Network bias to agree (or neutral)
@@ -3414,6 +3421,24 @@ int OnInit()
    gDayStamp=0; gTradesToday=0; gHalted=false;
    gDayStartEquity=gAccount.Equity();
    gLastBarTime=0;
+
+   //--- LIVE: startup summary so the running configuration is visible in the Experts log ---
+   bool _live=!MQLInfoInteger(MQL_TESTER);
+   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=live-ready",
+               (_live?"LIVE/DEMO":"STRATEGY TESTER"),_Symbol,EnumToString(_Period));
+   PrintFormat("    RISK   : mode=%s  risk=%.2f%%  maxLot=%.2f  maxTrades/day=%d  dailyLossHalt=%.1f%%",
+               (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay,InpMaxDailyLossPct);
+   PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=%s  trail=%s  BE=%s  partial=%s",
+               InpMinSLAtr,(InpTPMode==TP_NETWORK?"NETWORK/ARC":EnumToString(InpTPMode)),
+               (InpUseTrailing?"on":"off"),(InpUseBreakeven?"on":"off"),(InpUsePartial?"on":"off"));
+   PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
+               (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
+               (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
+   if(_live && InpMaxSpreadPoints<=0)
+      Print("    WARNING: spread guard is OFF (InpMaxSpreadPoints=0). On live XAUUSD set it to reject news-spike spreads.");
+   if(_live && (InpRiskPercent>2.0 || InpMaxLot>5.0))
+      Print("    WARNING: risk settings are aggressive for live - confirm InpRiskPercent / InpMaxLot before running.");
+
    return(INIT_SUCCEEDED);
 }
 
@@ -3443,6 +3468,35 @@ bool SessionOK()
    if(InpSessStartHour<=InpSessEndHour)
       return(dt.hour>=InpSessStartHour && dt.hour<InpSessEndHour);
    return(dt.hour>=InpSessStartHour || dt.hour<InpSessEndHour);
+}
+
+//==================================================================
+// LIVE SAFETY HELPERS
+//==================================================================
+//--- is it currently safe to place a NEW order? (always true in the Strategy Tester) ---
+bool TradingEnabled()
+{
+   if(MQLInfoInteger(MQL_TESTER)) return(true);                       // tester: never blocked
+   if(!TerminalInfoInteger(TERMINAL_CONNECTED))      return(false);   // no broker connection
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED))  return(false);   // AutoTrading button off
+   if(!MQLInfoInteger(MQL_TRADE_ALLOWED))            return(false);   // EA "Allow Algo Trading" off
+   if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))    return(false);   // broker/account disallows trading
+   if(!AccountInfoInteger(ACCOUNT_TRADE_EXPERT))     return(false);   // broker disallows EAs
+   return(true);
+}
+//--- would this order leave enough free margin? (and is the account's margin level safe?) ---
+bool MarginOK(const int dir,const double lot,const double price)
+{
+   if(InpHaltOnLowMargin){
+      double mlvl=AccountInfoDouble(ACCOUNT_MARGIN_LEVEL);            // 0 when no positions are open
+      if(mlvl>0.0 && mlvl<200.0) return(false);                      // margin level below 200% -> too hot to add risk
+   }
+   double need=0.0;
+   ENUM_ORDER_TYPE ot=(dir==1?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
+   if(!OrderCalcMargin(ot,_Symbol,lot,price,need)) return(true);     // can't compute -> don't block
+   double freeM=AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   double buffer=1.0-clamp(InpMarginBufferPct,0.0,90.0)/100.0;       // e.g. 5% -> may use up to 95% of free margin
+   return(need <= freeM*buffer);
 }
 
 //==================================================================
@@ -3812,6 +3866,7 @@ void TryEnter()
    }
    if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
    if(gMktClosed){ gEntryBlock="market closed (flip-close rejected)"; return; }   // a flip/opposite close was rejected because the market is shut -> do NOT open a fresh leg now
+   if(InpVerifyTradeAllowed && !TradingEnabled()){ gEntryBlock="algo-trading disabled / terminal not connected"; return; }
 
    sym.RefreshRates();
    double ask=sym.Ask(), bid=sym.Bid();
@@ -3826,6 +3881,8 @@ void TryEnter()
       double _rrF=_riskF>0?MathAbs(tp-entry)/_riskF:0.0;
       if(_rrF<InpMinEntryRR){ gEntryBlock="RR "+DoubleToString(_rrF,2)+" < min "+DoubleToString(InpMinEntryRR,2)+" (no room)"; return; }
    }
+   //--- LIVE: don't send an order the account can't safely afford ---
+   if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
    bool _arrow=(dir==1?cur_longSignal:cur_shortSignal);
    bool _doe=(dir==1?(cur_doeAction=="Long"):(cur_doeAction=="Short"));
    string _trig=fuEntry?"FU":mtfEntry?("MTF:"+cur_mtfEntryTF):aggressive?"V60AGG":(_arrow&&_doe)?"ARROW+DOE":_arrow?"ARROW":"DOE";
@@ -3843,8 +3900,21 @@ void TryEnter()
       if(dir==1) ok=trade.BuyLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
       else       ok=trade.SellLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
    } else {
-      if(dir==1) ok=trade.Buy(lot,_Symbol,ask,slBase,tp,cmt);
-      else       ok=trade.Sell(lot,_Symbol,bid,slBase,tp,cmt);
+      //--- LIVE: market send with retry on TRANSIENT broker errors (requote / price changed /
+      //  off-quotes / timeout). Re-quote the price each attempt. Non-transient errors stop the loop. ---
+      int _tries=MathMax(1,InpOrderRetries);
+      for(int _a=0;_a<_tries && !ok;_a++){
+         sym.RefreshRates();
+         double _ask=sym.Ask(), _bid=sym.Bid();
+         ok=(dir==1)? trade.Buy(lot,_Symbol,_ask,slBase,tp,cmt)
+                    : trade.Sell(lot,_Symbol,_bid,slBase,tp,cmt);
+         if(ok) break;
+         uint _rc=trade.ResultRetcode();
+         bool _transient=(_rc==TRADE_RETCODE_REQUOTE||_rc==TRADE_RETCODE_PRICE_CHANGED||
+                          _rc==TRADE_RETCODE_PRICE_OFF||_rc==TRADE_RETCODE_TIMEOUT);
+         if(!_transient) break;                       // hard error -> stop (MktClosed() handles the closed-market case below)
+         if(InpRetryWaitMs>0 && !MQLInfoInteger(MQL_TESTER)) Sleep(InpRetryWaitMs);
+      }
    }
    if(!ok) MktClosed();   // if the entry was rejected because the market is shut, arm the back-off so the same-tick ManagePositions() does not also hammer the broker
    if(ok){
