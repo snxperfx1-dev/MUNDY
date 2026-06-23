@@ -3177,7 +3177,7 @@ input group "Letra37 EA - v60 Context Filters"
 input bool   InpUseV60Context   = true;    // Compute v60 context (network / curve-life / TIE / narrative)
 input bool   InpReqNetAgree     = true;    // Require Invisible-Network bias to agree (or neutral)
 input bool   InpReqStackAgree   = false;   // Require v60 fractal stack to agree
-input bool   InpReqCurveAlive   = true;    // Require curve-life not DEAD at entry
+input bool   InpReqCurveAlive   = false;   // Require curve-life not DEAD at entry (OFF - a high/"alive" life = a MATURE curve near its top; requiring it biased entries to the END of the move. Life is a WINNER-management tool, not an entry filter)
 input double InpCurveAliveMin   = 33.0;    // Min curve-life to allow entry
 input bool   InpReqNarrative    = false;   // Require narrative not WEAKENING
 input bool   InpReqTimeAlign    = false;   // Require time-cycle alignment
@@ -3974,7 +3974,13 @@ void ManagePositions()
          if(InpExitOnPhaseFlip && (cur_ie1aPhase=="Absorption"||cur_ie1aPhase=="Retracement")){ DbgExit("phase-flip ("+cur_ie1aPhase+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
          if(InpExitOnOpposite && ((dir==1&&cur_shortSignal)||(dir==-1&&cur_longSignal))){ DbgExit("opposite signal printed",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
       }
-      if(canSoftExit){
+      //--- LIFE-SCORE MANAGEMENT: only ever act on a trade that is DEEP IN PROFIT (>=1R) and
+      //  past the minimum hold - NEVER around the entry zone or on a just-opened trade. The life
+      //  score dips constantly near entry / mid-build, so using it there was closing trades at or
+      //  near the open. It is a WINNER-management tool (lock/exit a profitable trade whose curve
+      //  has died), not an entry-zone filter. ---
+      bool lifeMgmtOK=(canSoftExit && rMult>=1.0);
+      if(lifeMgmtOK){
          //--- v60 curve-life exit: close when the curve in our direction goes DEAD ---
          if(InpUseV60Context && InpUseCurveLifeExit && ctx_life<=InpCurveDeadBelow && dir==ctx_waveDir){ DbgExit("curve-life dead (life "+DoubleToString(ctx_life,0)+"<="+IntegerToString((int)InpCurveDeadBelow)+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
          //--- v60 narrative management: decayed chain -> exit; fading story -> lock to break-even ---
