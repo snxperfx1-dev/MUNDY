@@ -3118,6 +3118,7 @@ input double        InpFixedLot         = 0.10;         // Fixed lot (LOT_FIXED)
 input double        InpRiskPercent      = 1.0;          // Risk % of equity (LOT_RISK_PCT)
 input double        InpMaxLot           = 2.0;          // Hard lot cap (reduced from 5: 5 lots/100k was ~3-5% risk/trade -> 96% DD)
 input int           InpMaxSpreadPoints  = 0;            // Max spread (points); 0=off (gold spreads are large!)
+input int           InpSlippageBufPoints= 0;            // SLIPPAGE CUSHION: add these points to the stop distance used for SIZING only (smaller lot on tight stops, so a fast-reversal slip doesn't blow past intended risk). 0=off. Try 200-600 on gold.
 
 input group "Letra37 EA - Small Account Mode (toggle)"
 input bool          InpSmallAccount       = false;      // TOGGLE: apply small-account sizing/limits below (overrides risk% + lot cap)
@@ -3163,13 +3164,19 @@ input group "Letra37 EA - Account Profit Guard (equity protection overlay)"
 //  This is a deliberate risk choice that scales OUT of winners — it WILL cap the biggest runners
 //  vs. the pure ownership engine. Toggle OFF to run the unmodified ownership engine.
 input bool          InpUseProfitGuard   = true;         // Master toggle for the account profit guard
-input double        InpPG_Tier1Pct      = 3.0;          // Tier 1: floating profit >= this % of balance -> move SL to BE + scale out to Tier1Close
-input double        InpPG_Tier1Close    = 40.0;         // Tier 1: cumulative % of ORIGINAL volume closed (40% off)
-input double        InpPG_Tier2Pct      = 6.0;          // Tier 2: profit >= this % of balance -> scale out more + start trailing
-input double        InpPG_Tier2Close    = 65.0;         // Tier 2: cumulative % of original closed (another 25% -> 65% total)
-input double        InpPG_Tier3Pct      = 10.0;         // Tier 3: profit >= this % of balance -> scale out + keep trailing
-input double        InpPG_Tier3Close    = 80.0;         // Tier 3: cumulative % of original closed (80% total, 20% runner)
-input double        InpPG_TrailAtrMult  = 2.0;          // Trailing distance (xATR) for Tier 2/3 (defends the locked profit)
+input double        InpPG_Tier1USD      = 1500;         // Tier 1: floating profit >= this $ -> move SL to break-even + scale out to Tier1Close
+input double        InpPG_Tier1Close    = 20.0;         // Tier 1: cumulative % of ORIGINAL volume closed
+input double        InpPG_Tier2USD      = 2500;         // Tier 2: profit >= this $ -> scale out more
+input double        InpPG_Tier2Close    = 40.0;         // Tier 2: cumulative % of original closed
+input double        InpPG_Tier3USD      = 4000;         // Tier 3: profit >= this $ -> scale out + start trailing
+input double        InpPG_Tier3Close    = 60.0;         // Tier 3: cumulative % of original closed
+input double        InpPG_Tier4USD      = 7000;         // Tier 4: profit >= this $ -> scale out + trail
+input double        InpPG_Tier4Close    = 80.0;         // Tier 4: cumulative % of original closed
+input double        InpPG_Tier5USD      = 10000;        // Tier 5: profit >= this $ -> scale out + trail
+input double        InpPG_Tier5Close    = 100.0;        // Tier 5: cumulative % of original closed (100 = fully out / bank the move; <100 leaves a runner)
+input bool          InpPG_BEAtTier1     = true;         // Move SL to break-even when Tier 1 fires
+input bool          InpPG_TrailFromTier3= true;         // Trail the remainder once Tier 3+ is active
+input double        InpPG_TrailAtrMult  = 2.0;          // Trailing distance (xATR) for the remainder
 input int           InpPG_BEOffsetPoints= 20;           // Break-even offset (points of locked profit) when Tier 1 fires
 input double        InpMaxLossPctBal    = 2.5;          // HARD BACKSTOP: force-close ANY position whose floating loss exceeds this % of balance (catches a missing/naked stop regardless of broker SL). 0 = off
 
@@ -3326,6 +3333,7 @@ double CalcLot(const double entry,const double sl)
    double riskPct=(InpSmallAccount? InpSmallAcctRiskPct : InpRiskPercent);   // small-account mode uses its own (lower) risk %
    double riskMoney=gAccount.Equity()*riskPct/100.0;
    double slPts=MathAbs(entry-sl)/_Point;
+   slPts+=MathMax(0,InpSlippageBufPoints);   // SLIPPAGE CUSHION: size as if the stop were this much wider -> smaller lot on tight stops, so a fast-reversal slip stays within intended risk
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
    double lot=riskMoney/(slPts*mpp);
@@ -3457,9 +3465,11 @@ int OnInit()
                (InpExitOnTermComplete?"on":"off"),
                (InpExitOnP2CHOCH?"on":"off"),InpP2CHOCHConfirmBars,
                (InpUseExhaustionExit?"on":"off"));
-   PrintFormat("    PROFGRD: %s  T1>=%.0f%%->%.0f%%off+BE  T2>=%.0f%%->%.0f%%off+trail  T3>=%.0f%%->%.0f%%off+trail  trailATRx%.1f",
-               (InpUseProfitGuard?"ON":"OFF"),InpPG_Tier1Pct,InpPG_Tier1Close,
-               InpPG_Tier2Pct,InpPG_Tier2Close,InpPG_Tier3Pct,InpPG_Tier3Close,InpPG_TrailAtrMult);
+   PrintFormat("    PROFGRD: %s  $%.0f/%.0f/%.0f/%.0f/%.0f -> %.0f/%.0f/%.0f/%.0f/%.0f%% off  BE@T1=%s  trail@T3+=%s",
+               (InpUseProfitGuard?"ON":"OFF"),
+               InpPG_Tier1USD,InpPG_Tier2USD,InpPG_Tier3USD,InpPG_Tier4USD,InpPG_Tier5USD,
+               InpPG_Tier1Close,InpPG_Tier2Close,InpPG_Tier3Close,InpPG_Tier4Close,InpPG_Tier5Close,
+               (InpPG_BEAtTier1?"y":"n"),(InpPG_TrailFromTier3?"y":"n"));
    PrintFormat("    BACKSTOP: hard per-trade loss cap = %s",
                (InpMaxLossPctBal>0.0? DoubleToString(InpMaxLossPctBal,1)+"%% of balance" : "OFF"));
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
@@ -4077,53 +4087,46 @@ void ManagePositions()
       //==================================================================
       // ACCOUNT PROFIT GUARD (equity-protection overlay, runs BEFORE the hold gate)
       //==================================================================
-      //  As floating profit grows (measured as % of ACCOUNT BALANCE), lock and bank in tiers:
-      //   Tier1 (>=3%): SL->break-even + scale out to 40% closed
-      //   Tier2 (>=6%): scale out to 65% closed + start ATR trailing
-      //   Tier3 (>=10%): scale out to 80% closed + keep ATR trailing (20% runner)
-      //  Each tier latches once (gMgPGTier). This is a deliberate equity choice that caps the
-      //  biggest runners vs. the pure ownership engine. Toggle InpUseProfitGuard to disable.
+      //  As floating profit ($) grows, lock and bank in 5 tiers (absolute account-currency):
+      //   T1 $1.5k -> SL to break-even + scale out to Tier1Close
+      //   T2 $2.5k -> scale out more
+      //   T3 $4k   -> scale out + start trailing the remainder
+      //   T4 $7k   -> scale out + trail
+      //   T5 $10k  -> scale out (100% = fully out / bank the move)
+      //  Tiers latch via gMgPGTier; a fast jump can fire several at once. Deliberate equity
+      //  choice that caps the biggest runners. Toggle InpUseProfitGuard to disable.
       if(InpUseProfitGuard && mi>=0){
-         double bal    =gAccount.Balance(); if(bal<=0) bal=gAccount.Equity();
-         double floatP =PositionGetDouble(POSITION_PROFIT);              // this position's floating P/L
-         double gainPct=(bal>0.0 ? floatP/bal*100.0 : 0.0);
+         double floatP =PositionGetDouble(POSITION_PROFIT);              // this position's floating P/L ($)
          double origVol=(gMgOrigVol[mi]>0.0 ? gMgOrigVol[mi] : PositionGetDouble(POSITION_VOLUME));
-         double curVol =PositionGetDouble(POSITION_VOLUME);
-         int    tier   =gMgPGTier[mi];
-         //--- Tier 1: 40% off FIRST, then (re)apply break-even on the remaining volume ---
-         //  Order matters: some brokers drop SL/TP from the remaining position on a partial close,
-         //  so we re-read POSITION_SL AFTER the partial and re-assert the break-even stop. ---
-         if(tier<1 && gainPct>=InpPG_Tier1Pct){
-            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier1Close))
-               DbgExit("PG T1 scale-out ("+DoubleToString(InpPG_Tier1Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
-            double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
-            double nowSL=PositionGetDouble(POSITION_SL);                 // re-read: the partial may have changed/dropped it
-            bool improve=(dir==1?(be>nowSL):(nowSL==0||be<nowSL));
-            if(improve){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,nowSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
-            gMgPGTier[mi]=1; gMgBEDone[mi]=true;
-            continue;   // re-evaluate next tick with the new volume/SL
+         double trigUSD[5]; double closePc[5];
+         trigUSD[0]=InpPG_Tier1USD; trigUSD[1]=InpPG_Tier2USD; trigUSD[2]=InpPG_Tier3USD; trigUSD[3]=InpPG_Tier4USD; trigUSD[4]=InpPG_Tier5USD;
+         closePc[0]=InpPG_Tier1Close; closePc[1]=InpPG_Tier2Close; closePc[2]=InpPG_Tier3Close; closePc[3]=InpPG_Tier4Close; closePc[4]=InpPG_Tier5Close;
+         //--- advance through every tier the current profit has reached (handles a fast jump past several) ---
+         bool closedOut=false;
+         while(gMgPGTier[mi]<5 && floatP>=trigUSD[gMgPGTier[mi]]){
+            int t=gMgPGTier[mi];                                         // 0-based tier about to fire
+            double curVol=PositionGetDouble(POSITION_VOLUME);
+            if(ProfitGuardScaleTo(tk,origVol,curVol,closePc[t]))
+               DbgExit("PG T"+IntegerToString(t+1)+" scale-out ("+DoubleToString(closePc[t],0)+"% @ $"+DoubleToString(floatP,0)+")",tk,dir,openP,mkt,rMult);
+            //--- Tier 1: move SL to break-even AFTER the partial (broker may drop SL on partial -> re-read & re-assert) ---
+            if(t==0 && InpPG_BEAtTier1){
+               double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
+               double nowSL=PositionGetDouble(POSITION_SL);
+               bool improve=(dir==1?(be>nowSL):(nowSL==0||be<nowSL));
+               if(improve && ((dir==1&&be<mkt)||(dir==-1&&be>mkt))){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,nowSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
+               gMgBEDone[mi]=true;
+            }
+            gMgPGTier[mi]=t+1;
+            if(!posinfo.SelectByTicket(tk)){ closedOut=true; break; }    // T5 100% closed the whole position
          }
-         //--- Tier 2: another scale-out (to 65%) + begin trailing ---
-         if(tier<2 && gainPct>=InpPG_Tier2Pct){
-            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier2Close))
-               DbgExit("PG T2 scale-out ("+DoubleToString(InpPG_Tier2Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
-            gMgPGTier[mi]=2;
-         }
-         //--- Tier 3: scale-out to 80% + keep trailing ---
-         else if(tier<3 && gainPct>=InpPG_Tier3Pct){
-            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier3Close))
-               DbgExit("PG T3 scale-out ("+DoubleToString(InpPG_Tier3Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
-            gMgPGTier[mi]=3;
-         }
-         //--- ATR trailing once Tier 2+ is active (defends the locked profit, leaves the runner room) ---
-         if(gMgPGTier[mi]>=2){
-            double liveSL=PositionGetDouble(POSITION_SL);                // re-read: a Tier2/3 partial may have dropped it
+         if(closedOut) continue;                                        // position gone -> next position
+         //--- trail the remainder once Tier 3+ is active (re-read live SL; re-assert if a partial dropped it) ---
+         if(InpPG_TrailFromTier3 && gMgPGTier[mi]>=3){
+            double liveSL=PositionGetDouble(POSITION_SL);
             double dist=atr*InpPG_TrailAtrMult; double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
             double newSL=(dir==1? mkt-dist : mkt+dist); newSL=NormPrice(newSL);
-            //  never trail to the losing side of entry
             if(dir==1 && newSL<openP) newSL=NormPrice(openP+InpPG_BEOffsetPoints*_Point);
             if(dir==-1&& newSL>openP) newSL=NormPrice(openP-InpPG_BEOffsetPoints*_Point);
-            //  apply if it improves OR if the live stop went missing (re-assert protection)
             bool tImprove=(liveSL==0.0) || (dir==1?(newSL>liveSL):(newSL<liveSL));
             if(tImprove && ((dir==1&&newSL<mkt)||(dir==-1&&newSL>mkt))){
                if(trade.PositionModify(tk,newSL,0.0)){ DbgMod("PG trail",tk,dir,liveSL,newSL,mkt); curSL=newSL; } else if(MktClosed()) return;
