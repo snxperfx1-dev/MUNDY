@@ -3171,6 +3171,7 @@ input double        InpPG_Tier3Pct      = 10.0;         // Tier 3: profit >= thi
 input double        InpPG_Tier3Close    = 80.0;         // Tier 3: cumulative % of original closed (80% total, 20% runner)
 input double        InpPG_TrailAtrMult  = 2.0;          // Trailing distance (xATR) for Tier 2/3 (defends the locked profit)
 input int           InpPG_BEOffsetPoints= 20;           // Break-even offset (points of locked profit) when Tier 1 fires
+input double        InpMaxLossPctBal    = 2.5;          // HARD BACKSTOP: force-close ANY position whose floating loss exceeds this % of balance (catches a missing/naked stop regardless of broker SL). 0 = off
 
 input group "Letra37 EA - Session / Guards"
 input bool          InpUseSession       = false;        // Restrict NEW ENTRY hours (server time) — does NOT close existing campaigns
@@ -3459,6 +3460,8 @@ int OnInit()
    PrintFormat("    PROFGRD: %s  T1>=%.0f%%->%.0f%%off+BE  T2>=%.0f%%->%.0f%%off+trail  T3>=%.0f%%->%.0f%%off+trail  trailATRx%.1f",
                (InpUseProfitGuard?"ON":"OFF"),InpPG_Tier1Pct,InpPG_Tier1Close,
                InpPG_Tier2Pct,InpPG_Tier2Close,InpPG_Tier3Pct,InpPG_Tier3Close,InpPG_TrailAtrMult);
+   PrintFormat("    BACKSTOP: hard per-trade loss cap = %s",
+               (InpMaxLossPctBal>0.0? DoubleToString(InpMaxLossPctBal,1)+"%% of balance" : "OFF"));
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
                (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
                (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
@@ -4054,6 +4057,20 @@ void ManagePositions()
          if(wantSL>0.0 && ((dir==1&&wantSL<mkt)||(dir==-1&&wantSL>mkt))){
             if(trade.PositionModify(tk,wantSL,0.0)){ DbgMod("SAFETY re-apply SL (was missing)",tk,dir,0.0,wantSL,mkt); curSL=wantSL; }
             else if(MktClosed()) return;
+         }
+      }
+
+      //--- HARD LOSS BACKSTOP: force-close any position whose floating loss exceeds InpMaxLossPctBal
+      //  % of balance. This is the absolute catch-all for a naked/missing stop (the disappearing-SL
+      //  case) — even if the broker dropped the SL and the re-apply above failed, a position can
+      //  never lose more than this % of the account. Independent of all curve/ownership logic. ---
+      if(InpMaxLossPctBal>0.0){
+         double _bal=gAccount.Balance(); if(_bal<=0) _bal=gAccount.Equity();
+         double _flt=PositionGetDouble(POSITION_PROFIT);
+         if(_bal>0.0 && _flt < -(_bal*InpMaxLossPctBal/100.0)){
+            DbgExit("HARD LOSS BACKSTOP ("+DoubleToString(_flt/_bal*100.0,1)+"% of bal < -"+DoubleToString(InpMaxLossPctBal,1)+"%)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
       }
 
