@@ -3225,6 +3225,12 @@ input bool   InpUseRiskThrottle   = true;  // DRDWCT-lite: vol-scaled risk + ris
 input double InpRDLimit           = 0.01;  // Risk-density cap: max lots per 1.0 price-unit of stop distance (tiny-stop -> oversized-lot guard)
 input double InpMaxOpenRiskPct    = 6.0;   // Block NEW entries when open positions' risk-to-SL exceeds this % of equity
 
+input group "Letra37 EA - SYMPHONY Entry Trigger (precise 'when')"
+input bool   InpUseSymphonyTrigger = true; // Require the SYMPHONY EVENT trigger: enter on the closed-bar momentum inflection (the turn), not just on a true state
+input bool   InpRequireMomFlip     = true; // Require the bar-to-bar momentum DELTA to flip INTO the trade direction (the inflection bar)
+input double InpEntryRetrMin       = 0.30; // Continuation entries: min retracement fraction of the leg (SYMPHONY 0.30)
+input double InpEntryRetrMax       = 0.80; // Continuation entries: max retracement fraction (beyond = too deep -> skip)
+
 //==================================================================
 // EA GLOBALS
 //==================================================================
@@ -3696,6 +3702,40 @@ double ComputeTP(const int dir,const double entry,const double sl)
    return(NormPrice(tp));
 }
 
+//--- SYMPHONY ENTRY MECHANISM (ported): the precise "WHEN". On the closed chart bar, require a
+//  momentum-delta inflection INTO the trade direction (the turn), at a measured retracement
+//  depth for continuation entries, with the inducement complete (not still inside the manip
+//  band). This converts F16's STATE-based entry into an EVENT-based one that lands on the curve.
+//  F16's context (entry-cycle gate) already decided WHETHER; this decides exactly WHEN. ---
+bool SymphonyTrigger(const int dir)
+{
+   if(!InpUseSymphonyTrigger) return(true);
+   int nb=(int)ArraySize(eaC);
+   if(nb<4) return(true);                              // not enough closed bars -> don't block (startup only)
+   int last=nb-2;                                      // last CLOSED chart bar
+   double d1=eaC[last]-eaC[last-1];                    // most-recent closed-bar delta
+   double d2=eaC[last-1]-eaC[last-2];                  // the delta before it
+   //--- 1) momentum inflection INTO the trade direction = the turn bar ---
+   if(InpRequireMomFlip)
+   {
+      bool flip=(dir==1)? (d1>=0.0 && d2<0.0) : (d1<=0.0 && d2>0.0);
+      if(!flip){ gEntryBlock="awaiting momentum flip (on-curve turn)"; return(false); }
+   }
+   //--- 2) retracement band - CONTINUATION entries only (dir == live wave). Reversal/terminal
+   //       location is already handled by the at-flip + shift gate. ctx_retrX: 0 at the leg
+   //       extreme, 100 back at the invalidation/origin. ---
+   if(InpUseV60Context && ctx_waveDir==dir)
+   {
+      double r=ctx_retrX/100.0;
+      if(r<InpEntryRetrMin || r>InpEntryRetrMax)
+      { gEntryBlock="retrace "+DoubleToString(r,2)+" out of band ["+DoubleToString(InpEntryRetrMin,2)+"-"+DoubleToString(InpEntryRetrMax,2)+"]"; return(false); }
+   }
+   //--- 3) inducement complete: never enter while still inside the manipulation band ---
+   if(InpUseV60Context && ctx_inManipBand && !ctx_atTrueInduction)
+   { gEntryBlock="inducement not complete (in manip band)"; return(false); }
+   return(true);
+}
+
 void TryEnter()
 {
    int dir=DesiredDirection();
@@ -3771,6 +3811,9 @@ void TryEnter()
       bool _cycleOK = _withCurve || _terminalEntry;
       if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
    }
+   //--- SYMPHONY precise trigger: enter on the TURN (closed-bar momentum inflection at the right
+   //  retrace depth, inducement complete) - the "exactly WHEN" on top of the context "WHETHER". ---
+   if(!SymphonyTrigger(dir)) return;
    if(!aggressive){
       if(!PassesFilters(dir)) return;          // strict Letra path keeps full filters
    } else {
