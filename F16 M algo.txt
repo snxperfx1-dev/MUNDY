@@ -3204,6 +3204,9 @@ input int    InpOrderRetries       = 3;     // LIVE: retry a market order this m
 input int    InpRetryWaitMs        = 200;   // LIVE: wait between order retries (ms)
 input double InpMarginBufferPct    = 5.0;   // LIVE: keep this % of free margin unused - block a new entry that would consume more
 input bool   InpHaltOnLowMargin    = true;  // LIVE: block new entries when the margin level is unsafe
+//--- SLIPPAGE GUARD (entry-side: the only slippage an EA can actually control) ---
+input int    InpMaxEntrySlipPoints = 100;   // SLIPPAGE GUARD: reject a market entry if price has moved more than this many points from the intended price at send time (don't chase a fast move). 0 = off
+input bool   InpLogSlippage        = true;  // Log requested-vs-filled entry price so you can measure real slippage in the Experts log
 
 input group "Letra37 EA - v60 Context Filters"
 input bool   InpUseV60Context   = true;    // Compute v60 context (network / curve-life / TIE / narrative)
@@ -3472,6 +3475,10 @@ int OnInit()
                (InpPG_BEAtTier1?"y":"n"),(InpPG_TrailFromTier3?"y":"n"));
    PrintFormat("    BACKSTOP: hard per-trade loss cap = %s",
                (InpMaxLossPctBal>0.0? DoubleToString(InpMaxLossPctBal,1)+"%% of balance" : "OFF"));
+   PrintFormat("    SLIPGRD: entry no-chase cap=%s  sizingCushion=%dpts  fillLog=%s  deviation=%dpts  spreadGuard=%s",
+               (InpMaxEntrySlipPoints>0? IntegerToString(InpMaxEntrySlipPoints)+"pts":"OFF"),
+               InpSlippageBufPoints,(InpLogSlippage?"on":"off"),(int)InpDeviation,
+               (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
                (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
                (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
@@ -3916,6 +3923,17 @@ void TryEnter()
       for(int _a=0;_a<_tries && !ok;_a++){
          sym.RefreshRates();
          double _ask=sym.Ask(), _bid=sym.Bid();
+         //--- SLIPPAGE GUARD: don't CHASE a fast move. If the live price has run more than
+         //  InpMaxEntrySlipPoints away from the intended entry, abort instead of filling worse. ---
+         if(InpMaxEntrySlipPoints>0){
+            double _livePx=(dir==1?_ask:_bid);
+            double _slip=MathAbs(_livePx-entry)/_Point;
+            if(_slip>InpMaxEntrySlipPoints){
+               gEntryBlock="slippage guard: price moved "+DoubleToString(_slip,0)+"pts > "+IntegerToString(InpMaxEntrySlipPoints)+" (no chase)";
+               if(InpLogSlippage) Print("=== ENTRY ABORTED (slippage guard): intended ",DoubleToString(entry,_Digits)," live ",DoubleToString(_livePx,_Digits)," = ",DoubleToString(_slip,0),"pts > cap ",InpMaxEntrySlipPoints);
+               break;
+            }
+         }
          ok=(dir==1)? trade.Buy(lot,_Symbol,_ask,slBase,tp,cmt)
                     : trade.Sell(lot,_Symbol,_bid,slBase,tp,cmt);
          if(ok) break;
@@ -3957,6 +3975,11 @@ void TryEnter()
          if(pt==0) continue;
          if(PositionGetInteger(POSITION_MAGIC)==(long)InpMagic && PositionGetString(POSITION_SYMBOL)==_Symbol){
             double psl=PositionGetDouble(POSITION_SL);
+            //--- SLIPPAGE LOG: how far the actual fill was from the intended entry price ---
+            if(InpLogSlippage){
+               double _fillSlip=(PositionGetDouble(POSITION_PRICE_OPEN)-entry)/_Point;
+               Print("=== FILL slippage: intended ",DoubleToString(entry,_Digits)," filled ",DoubleToString(PositionGetDouble(POSITION_PRICE_OPEN),_Digits)," = ",DoubleToString(_fillSlip,0),"pts (",(dir==1?"+adverse":"-favorable"),")");
+            }
             double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
             double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
             //--- SPEC AUDIT: no TP1/partial registration. Register SL + ORIGINAL volume (for profit-guard scale-outs). ---
