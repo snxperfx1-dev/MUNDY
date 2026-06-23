@@ -3157,6 +3157,21 @@ input bool          InpExitOnTermComplete  = true;      // EXIT: close when the 
 input bool          InpExitOnP2CHOCH       = true;      // EXIT: close when a Phase-2 CHOCH prints against the position (internal structure proves campaign failure)
 input int           InpP2CHOCHConfirmBars  = 2;         // Bars of continued adverse structure to confirm a genuine P2 CHOCH (vs. wick noise)
 
+input group "Letra37 EA - Account Profit Guard (equity protection overlay)"
+//  OVERLAY on top of the pure ownership engine: protects realized equity as floating profit
+//  grows, measured as % of ACCOUNT BALANCE (not RR / not curve logic). Each tier latches once.
+//  This is a deliberate risk choice that scales OUT of winners — it WILL cap the biggest runners
+//  vs. the pure ownership engine. Toggle OFF to run the unmodified ownership engine.
+input bool          InpUseProfitGuard   = true;         // Master toggle for the account profit guard
+input double        InpPG_Tier1Pct      = 3.0;          // Tier 1: floating profit >= this % of balance -> move SL to BE + scale out to Tier1Close
+input double        InpPG_Tier1Close    = 40.0;         // Tier 1: cumulative % of ORIGINAL volume closed (40% off)
+input double        InpPG_Tier2Pct      = 6.0;          // Tier 2: profit >= this % of balance -> scale out more + start trailing
+input double        InpPG_Tier2Close    = 65.0;         // Tier 2: cumulative % of original closed (another 25% -> 65% total)
+input double        InpPG_Tier3Pct      = 10.0;         // Tier 3: profit >= this % of balance -> scale out + keep trailing
+input double        InpPG_Tier3Close    = 80.0;         // Tier 3: cumulative % of original closed (80% total, 20% runner)
+input double        InpPG_TrailAtrMult  = 2.0;          // Trailing distance (xATR) for Tier 2/3 (defends the locked profit)
+input int           InpPG_BEOffsetPoints= 20;           // Break-even offset (points of locked profit) when Tier 1 fires
+
 input group "Letra37 EA - Session / Guards"
 input bool          InpUseSession       = false;        // Restrict NEW ENTRY hours (server time) — does NOT close existing campaigns
 input int           InpSessStartHour    = 7;            // Session start hour
@@ -3257,6 +3272,8 @@ datetime eaT[]; double eaO[],eaH[],eaL[],eaC[],eaVol[];
 
 //--- per-ticket management memory ---
 ulong  gMgTicket[]; double gMgInitSL[]; double gMgTP1[]; bool gMgPartialDone[]; bool gMgBEDone[]; int gMgDir[];
+//--- account profit-guard memory: original volume (for scale-out targets) + which tier has fired (0..3) ---
+double gMgOrigVol[]; int gMgPGTier[];
 
 //==================================================================
 // HELPERS
@@ -3335,18 +3352,21 @@ void ComputeARC()
 
 //--- management memory ---
 int MgIndex(const ulong tk){ for(int q=0;q<ArraySize(gMgTicket);q++) if(gMgTicket[q]==tk) return(q); return(-1); }
-void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir)
+void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir,const double origVol=0.0)
 {
    if(MgIndex(tk)>=0) return;
    int s=ArraySize(gMgTicket);
    ArrayResize(gMgTicket,s+1);ArrayResize(gMgInitSL,s+1);ArrayResize(gMgTP1,s+1);ArrayResize(gMgPartialDone,s+1);ArrayResize(gMgBEDone,s+1);ArrayResize(gMgDir,s+1);
+   ArrayResize(gMgOrigVol,s+1);ArrayResize(gMgPGTier,s+1);
    gMgTicket[s]=tk; gMgInitSL[s]=initSL; gMgTP1[s]=tp1; gMgPartialDone[s]=false; gMgBEDone[s]=false; gMgDir[s]=dir;
+   gMgOrigVol[s]=origVol; gMgPGTier[s]=0;
 }
 void MgCleanup()
 {
    for(int q=ArraySize(gMgTicket)-1;q>=0;q--){
       if(!posinfo.SelectByTicket(gMgTicket[q])){
          ArrayRemove(gMgTicket,q,1);ArrayRemove(gMgInitSL,q,1);ArrayRemove(gMgTP1,q,1);ArrayRemove(gMgPartialDone,q,1);ArrayRemove(gMgBEDone,q,1);ArrayRemove(gMgDir,q,1);
+         ArrayRemove(gMgOrigVol,q,1);ArrayRemove(gMgPGTier,q,1);
       }
    }
 }
@@ -3436,6 +3456,9 @@ int OnInit()
                (InpExitOnTermComplete?"on":"off"),
                (InpExitOnP2CHOCH?"on":"off"),InpP2CHOCHConfirmBars,
                (InpUseExhaustionExit?"on":"off"));
+   PrintFormat("    PROFGRD: %s  T1>=%.0f%%->%.0f%%off+BE  T2>=%.0f%%->%.0f%%off+trail  T3>=%.0f%%->%.0f%%off+trail  trailATRx%.1f",
+               (InpUseProfitGuard?"ON":"OFF"),InpPG_Tier1Pct,InpPG_Tier1Close,
+               InpPG_Tier2Pct,InpPG_Tier2Close,InpPG_Tier3Pct,InpPG_Tier3Close,InpPG_TrailAtrMult);
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
                (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
                (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
@@ -3923,8 +3946,9 @@ void TryEnter()
             double psl=PositionGetDouble(POSITION_SL);
             double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
             double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
-            //--- SPEC AUDIT: no TP1/partial registration. Position registered for SL tracking only. ---
-            MgRegister(pt,psl,NA,dir);
+            //--- SPEC AUDIT: no TP1/partial registration. Register SL + ORIGINAL volume (for profit-guard scale-outs). ---
+            double _ovol=PositionGetDouble(POSITION_VOLUME);
+            MgRegister(pt,psl,NA,dir,_ovol);
             break;
          }
       }
@@ -3966,6 +3990,25 @@ bool MktClosed()
    }
    return false;
 }
+//--- ACCOUNT PROFIT GUARD: scale OUT so the cumulative closed volume reaches targetClosedPct of
+//  the ORIGINAL volume. Returns true if a partial close was performed (leaves >= 1 min-lot runner). ---
+bool ProfitGuardScaleTo(const ulong tk,const double origVol,const double curVol,const double targetClosedPct)
+{
+   if(origVol<=0.0 || curVol<=0.0) return(false);
+   double step  =SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP); if(step<=0) step=0.01;
+   double minlot=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double remTarget=origVol*(1.0-targetClosedPct/100.0);     // volume to KEEP after this tier
+   double closeVol =curVol-remTarget;                        // volume to close now
+   closeVol=MathFloor(closeVol/step)*step;
+   if(closeVol<minlot) return(false);                        // nothing meaningful to close yet
+   if(curVol-closeVol<minlot){                               // keep at least a min-lot runner
+      closeVol=MathFloor((curVol-minlot)/step)*step;
+      if(closeVol<minlot) return(false);
+   }
+   if(trade.PositionClosePartial(tk,closeVol)) return(true);
+   MktClosed();
+   return(false);
+}
 void ManagePositions()
 {
    if(gMktClosed) return;
@@ -4000,6 +4043,56 @@ void ManagePositions()
       double initSL=(mi>=0?gMgInitSL[mi]:curSL);
       double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;
       double rMult =(dir==1?(mkt-openP):(openP-mkt))/risk;
+
+      //==================================================================
+      // ACCOUNT PROFIT GUARD (equity-protection overlay, runs BEFORE the hold gate)
+      //==================================================================
+      //  As floating profit grows (measured as % of ACCOUNT BALANCE), lock and bank in tiers:
+      //   Tier1 (>=3%): SL->break-even + scale out to 40% closed
+      //   Tier2 (>=6%): scale out to 65% closed + start ATR trailing
+      //   Tier3 (>=10%): scale out to 80% closed + keep ATR trailing (20% runner)
+      //  Each tier latches once (gMgPGTier). This is a deliberate equity choice that caps the
+      //  biggest runners vs. the pure ownership engine. Toggle InpUseProfitGuard to disable.
+      if(InpUseProfitGuard && mi>=0){
+         double bal    =gAccount.Balance(); if(bal<=0) bal=gAccount.Equity();
+         double floatP =PositionGetDouble(POSITION_PROFIT);              // this position's floating P/L
+         double gainPct=(bal>0.0 ? floatP/bal*100.0 : 0.0);
+         double origVol=(gMgOrigVol[mi]>0.0 ? gMgOrigVol[mi] : PositionGetDouble(POSITION_VOLUME));
+         double curVol =PositionGetDouble(POSITION_VOLUME);
+         int    tier   =gMgPGTier[mi];
+         //--- Tier 1: break-even + 40% off ---
+         if(tier<1 && gainPct>=InpPG_Tier1Pct){
+            double be=openP+(dir==1?InpPG_BEOffsetPoints*_Point:-InpPG_BEOffsetPoints*_Point); be=NormPrice(be);
+            bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
+            if(improve){ if(trade.PositionModify(tk,be,0.0)){ DbgMod("PG T1 ->BE",tk,dir,curSL,be,mkt); curSL=be; } else if(MktClosed()) return; }
+            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier1Close))
+               DbgExit("PG T1 scale-out ("+DoubleToString(InpPG_Tier1Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
+            gMgPGTier[mi]=1; gMgBEDone[mi]=true;
+            continue;   // re-evaluate next tick with the new volume/SL
+         }
+         //--- Tier 2: another scale-out (to 65%) + begin trailing ---
+         if(tier<2 && gainPct>=InpPG_Tier2Pct){
+            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier2Close))
+               DbgExit("PG T2 scale-out ("+DoubleToString(InpPG_Tier2Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
+            gMgPGTier[mi]=2;
+         }
+         //--- Tier 3: scale-out to 80% + keep trailing ---
+         else if(tier<3 && gainPct>=InpPG_Tier3Pct){
+            if(ProfitGuardScaleTo(tk,origVol,curVol,InpPG_Tier3Close))
+               DbgExit("PG T3 scale-out ("+DoubleToString(InpPG_Tier3Close,0)+"% off @ "+DoubleToString(gainPct,1)+"% bal)",tk,dir,openP,mkt,rMult);
+            gMgPGTier[mi]=3;
+         }
+         //--- ATR trailing once Tier 2+ is active (defends the locked profit, leaves the runner room) ---
+         if(gMgPGTier[mi]>=2){
+            double dist=atr*InpPG_TrailAtrMult; double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
+            double newSL=(dir==1? mkt-dist : mkt+dist); newSL=NormPrice(newSL);
+            bool tImprove=(dir==1?(newSL>curSL):(curSL==0||newSL<curSL));
+            // never trail to the losing side of entry
+            if(dir==1 && newSL<openP) tImprove=false;
+            if(dir==-1&& newSL>openP) tImprove=false;
+            if(tImprove){ if(trade.PositionModify(tk,newSL,0.0)){ DbgMod("PG trail",tk,dir,curSL,newSL,mkt); curSL=newSL; } else if(MktClosed()) return; }
+         }
+      }
 
       //--- minimum hold gate: never exit on the entry bar (noise) ---
       int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
