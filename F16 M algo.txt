@@ -3089,8 +3089,7 @@ void ContextRun(const int bars)
 enum ENUM_SIG_SOURCE { SIG_ENGINE, SIG_V72, SIG_EITHER, SIG_BOTH };   // arrows / DOE / either(OR) / both(AND)
 enum ENUM_LOT_MODE   { LOT_FIXED, LOT_RISK_PCT };
 enum ENUM_SL_MODE    { SL_ENGINE, SL_ATR, SL_FIXED };
-enum ENUM_TP_MODE    { TP_NETWORK, TP_RR, TP_ATR };   // FU/Invisible-Network attractor / RR / ATR
-enum ENUM_TRAIL_MODE { TRAIL_ATR, TRAIL_POINTS };
+//  SPEC AUDIT: ENUM_TP_MODE and ENUM_TRAIL_MODE removed (no TP targets, no trailing).
 enum ENUM_MIN_GRADE  { G_APLUS, G_A, G_B, G_C, G_D };
 
 //==================================================================
@@ -3138,38 +3137,32 @@ input double        InpMaxSLAtr         = 10.0;         // Safety cap on total S
 input bool          InpCompSizing       = true;         // Recursion-size-aware sizing: compression sets stop distance + partial timing (wide loop=wider stop, failure-swing=tighter)
 
 input group "Letra37 EA - Take Profit"
-input ENUM_TP_MODE  InpTPMode           = TP_NETWORK;   // Take-profit source (FU / Invisible-Network attractor)
-input double        InpTPrr             = 2.0;          // TP = RR * risk (TP_RR)
-input double        InpTPAtrMult        = 3.0;          // TP = ATR * mult (TP_ATR)
-input bool          InpUsePartial       = false;        // Partial close at first target (OFF - was trimming 50% almost instantly; let the FULL position run to the ARC apex / structure SL)
-input double        InpPartialPct       = 50.0;         // Partial close % at TP1
-input bool          InpMoveBEAfterTP1   = false;        // Move SL to BE after partial (OFF - let the runner breathe to target)
+//  SPEC AUDIT: ALL take-profit logic REMOVED. Campaigns are NOT closed because a reward ratio
+//  was reached. The position lives until ownership transfers or the campaign's terminal sequence
+//  completes. The broker order has TP=0 (no server TP). Structure SL remains the only hard stop.
+//  (Retained as empty group for input-ordering backward compat; inputs deleted.)
 
-input group "Letra37 EA - Trade Management"
-input bool          InpUseBreakeven     = false;        // Enable break-even (OFF - was scratching winners; let the trade work)
-input double        InpBETriggerRR      = 1.0;          // BE trigger in RR (earlier: winners were giving back before 3R)
-input double        InpBETriggerPoints  = 300;         // BE trigger in ticks/points (whichever hits first)
-input int           InpBEOffsetPoints   = 20;          // BE offset (points, locked profit)
-input bool          InpUseTrailing      = false;        // Enable trailing stop (OFF - trailing was cutting runners short)
-input ENUM_TRAIL_MODE InpTrailMode      = TRAIL_ATR;    // Trailing mode
-input double        InpTrailAtrMult     = 2.0;          // Trail distance = ATR * mult
-input int           InpTrailPoints      = 200;          // Trail distance (points)
-input int           InpTrailStepPoints  = 20;           // Min step to move trail (points)
-input bool          InpExitOnOpposite   = false;        // Close on opposite engine signal (OFF - let the trade run to SL/TP)
-input bool          InpExitOnInvalid    = false;        // Close on engine invalidation (OFF - the structure SL is the only stop)
-input bool          InpExitOnPhaseFlip  = false;        // Close on Absorption/Retracement phase (off - was cutting too early)
-input int           InpMinHoldBars      = 5;            // Min bars to hold before ANY discretionary exit (SL/TP always active)
-input bool          InpHoldWithThesis   = true;         // HOLD a bias-aligned trade through opposite signals while the thesis still supports it
-input bool          InpExitOnThesisFlip = false;         // CLOSE an open trade when the dominant thesis flips against it (keeps the position matching the panel)
+input group "Letra37 EA - Trade Management (F72 OWNERSHIP EXITS ONLY)"
+//  SPEC AUDIT: break-even, trailing, partial, session-end, thesis-flip, phase-flip, opposite-
+//  signal, life-score, narrative — ALL removed. Recursive waves naturally contain pullbacks,
+//  internal liquidation, and ownership oscillation that are NORMAL, not exit signals.
+//  EXIT ONLY on (1) ownership transfer, (2) terminal sequence completion, (3) Phase-2 CHOCH
+//  against position. These are computed from live engine state each bar.
+input int           InpMinHoldBars      = 3;            // Min bars to hold before ANY campaign exit fires (protects against entry-bar reversal noise)
+input bool          InpExitOnOwnerTransfer = true;      // EXIT: close when curve OWNERSHIP has fully transferred away from the trade's campaign direction
+input double        InpOwnerTransferThresh = 65.0;      // Ownership transfer %: the opposing curve must dominate by at least this % to confirm transfer
+input bool          InpExitOnTermComplete  = true;      // EXIT: close when the terminal sequence of the campaign's S/D transition has completed (campaign naturally finished)
+input bool          InpExitOnP2CHOCH       = true;      // EXIT: close when a Phase-2 CHOCH prints against the position (internal structure proves campaign failure)
+input int           InpP2CHOCHConfirmBars  = 2;         // Bars of continued adverse structure to confirm a genuine P2 CHOCH (vs. wick noise)
 
 input group "Letra37 EA - Session / Guards"
-input bool          InpUseSession       = false;        // Restrict trading hours (server time)
+input bool          InpUseSession       = false;        // Restrict NEW ENTRY hours (server time) — does NOT close existing campaigns
 input int           InpSessStartHour    = 7;            // Session start hour
 input int           InpSessEndHour      = 20;           // Session end hour
 input bool          InpSkipFriday       = false;        // No new trades on Friday
-input bool          InpCloseAtSessEnd   = false;        // Close all at session end
-input double        InpMaxDailyLossPct  = 0.0;          // Halt after daily loss % (0=OFF - daily-loss limit removed per request)
-input int           InpMaxTradesPerDay  = 20;           // Max new trades per day (0=off)
+//  SPEC AUDIT: InpCloseAtSessEnd REMOVED (session exit artificially terminates campaigns).
+//  SPEC AUDIT: InpMaxDailyLossPct REMOVED (daily risk closure is an external constraint, not curve logic).
+input int           InpMaxTradesPerDay  = 20;           // Max new trades per day (0=off) — limits ENTRIES, not exits
 
 input group "Letra37 EA - Misc"
 input ulong         InpMagic            = 370037;       // Magic number
@@ -3225,7 +3218,7 @@ input double InpChainExitBelow  = 25.0;    // Exit when chain vitality <= this (
 input group "Letra37 EA - F72 Entry Cycle (curve ownership)"
 input bool   InpRequireEntryCycle = true;  // F72: only enter once the ENTRY CYCLE has begun (build-vs-execute) - applies to ALL sources (arrows/DOE/FU/MTF)
 input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme compression or on a failure-swing (compressed/volatile curves fire fast - never miss them)
-input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
+//  SPEC AUDIT: InpMinEntryRR REMOVED (was testing against a TP target that no longer exists; campaigns have no RR ceiling)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
@@ -3252,9 +3245,7 @@ CAccountInfo  gAccount;
 
 datetime gLastBarTime   = 0;
 datetime gDayStamp      = 0;
-double   gDayStartEquity= 0.0;
 int      gTradesToday   = 0;
-bool     gHalted        = false;
 string   gEntryBlock    = "-";   // live reason the EA is NOT entering (shown in panel)
 double   gRecSizeMult   = 1.0;   // recursion-size-aware stop multiplier (set per entry from compression)
 bool     gMktClosed     = false; // set when a management/flip order is rejected with 'Market closed' - stops the every-tick retry storm; reset each new bar (server SL/TP still protect the position)
@@ -3427,19 +3418,22 @@ int OnInit()
    ResetState();
    g_lastProcessed=-1;
 
-   gDayStamp=0; gTradesToday=0; gHalted=false;
-   gDayStartEquity=gAccount.Equity();
+   gDayStamp=0; gTradesToday=0;
    gLastBarTime=0;
 
    //--- LIVE: startup summary so the running configuration is visible in the Experts log ---
    bool _live=!MQLInfoInteger(MQL_TESTER);
-   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=live-ready",
+   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=f72-ownership-engine-v1",
                (_live?"LIVE/DEMO":"STRATEGY TESTER"),_Symbol,EnumToString(_Period));
-   PrintFormat("    RISK   : mode=%s  risk=%.2f%%  maxLot=%.2f  maxTrades/day=%d  dailyLossHalt=%.1f%%",
-               (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay,InpMaxDailyLossPct);
-   PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=%s  trail=%s  BE=%s  partial=%s",
-               InpMinSLAtr,(InpTPMode==TP_NETWORK?"NETWORK/ARC":EnumToString(InpTPMode)),
-               (InpUseTrailing?"on":"off"),(InpUseBreakeven?"on":"off"),(InpUsePartial?"on":"off"));
+   PrintFormat("    RISK   : mode=%s  risk=%.2f%%  maxLot=%.2f  maxTrades/day=%d",
+               (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay);
+   PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=NONE (ownership exits only)  trail=REMOVED  BE=REMOVED  partial=REMOVED",
+               InpMinSLAtr);
+   PrintFormat("    EXITS  : ownerTransfer=%s(%.0f%%)  termComplete=%s  p2Choch=%s(%d bars)  exhaustion=%s",
+               (InpExitOnOwnerTransfer?"on":"off"),InpOwnerTransferThresh,
+               (InpExitOnTermComplete?"on":"off"),
+               (InpExitOnP2CHOCH?"on":"off"),InpP2CHOCHConfirmBars,
+               (InpUseExhaustionExit?"on":"off"));
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
                (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
                (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
@@ -3461,14 +3455,12 @@ void OnDeinit(const int reason){ Comment(""); }
 //==================================================================
 void DailyRollover()
 {
+   //--- SPEC AUDIT: daily loss halt REMOVED (external constraint, not curve logic).
+   //  Retain only the daily trade counter reset for max-trades-per-day entry guard. ---
    MqlDateTime dt; TimeToStruct(TimeCurrent(),dt);
    datetime dayKey=(datetime)(dt.year*10000+dt.mon*100+dt.day);
    if(dayKey!=gDayStamp){
-      gDayStamp=dayKey; gTradesToday=0; gHalted=false; gDayStartEquity=gAccount.Equity();
-   }
-   if(InpMaxDailyLossPct>0.0){
-      double dd=(gDayStartEquity-gAccount.Equity())/MathMax(gDayStartEquity,1.0)*100.0;
-      if(dd>=InpMaxDailyLossPct){ gHalted=true; }
+      gDayStamp=dayKey; gTradesToday=0;
    }
 }
 
@@ -3608,12 +3600,7 @@ double RecSizeMult()
    string r=cur_compRegime;
    return( r=="Extreme"?0.65 : r=="High"?0.80 : r=="Medium"?1.0 : 1.25 );  // Low compression = wide loops
 }
-double PartialFrac()
-{
-   if(!InpCompSizing || !InpUseV60Context) return(1.0);
-   string r=cur_compRegime;
-   return( r=="Extreme"?0.40 : r=="High"?0.55 : r=="Medium"?0.75 : 1.0 );  // compressed = bank partial sooner
-}
+//--- SPEC AUDIT: PartialFrac() removed (partial close logic deleted — campaigns run to completion).
 
 //--- protective stop just beyond the recent KEY swing high/low (real structure).
 //--- long  -> below the lowest low of the last InpSwingLookback closed bars
@@ -3711,38 +3698,11 @@ double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,co
 
 double ComputeTP(const int dir,const double entry,const double sl)
 {
-   double atr=cur_atr; if(atr<=0) atr=10*_Point;
-   double risk=MathAbs(entry-sl);
-   double tp=0.0;
-   if(InpTPMode==TP_NETWORK){
-      // FU pool / Invisible-Network attractor — the magnet price is heading for
-      tp = !naf(ctx_netTarget)?ctx_netTarget : !naf(ctx_attractorPx)?ctx_attractorPx : entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-      //--- LET WINNERS RUN to the TERMINAL curve target (far FU flip / future-return-zone),
-      //  not just the nearest network attractor. The near magnet was capping winners around
-      //  1.5-2R while losers ran the full structure stop (the payoff-ratio bleed = "trades not
-      //  running"). Reach for the far terminal flip whenever it sits further in our direction;
-      //  the composite exhaustion exit banks genuine terminal exhaustion before a full round-
-      //  trip. (Previously this only applied in "Low" compression - now all regimes.) ---
-      double far=(dir==1?ctx_fezHi:ctx_fezLo);
-      if(!naf(far) && ((dir==1&&far>tp)||(dir==-1&&far<tp))) tp=far;
-   } else if(InpTPMode==TP_ATR){
-      tp=entry+(dir==1? atr*InpTPAtrMult : -atr*InpTPAtrMult);
-   } else {
-      tp=entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-   }
-   //--- ARC curved target (SYMPHONY port): the convex apex is the real curve target the move
-   //  is projected to reach; use it when it sits FURTHER than the mode target (improves RR by
-   //  letting winners run to the curve apex instead of a flat near attractor). ---
-   if(InpUseARCTarget && !naf(ctx_arcApex) && ctx_arcDir==dir){
-      if((dir==1 && ctx_arcApex>tp) || (dir==-1 && ctx_arcApex<tp)) tp=ctx_arcApex;
-   }
-   //--- validate side; fall back to RR if engine target is on the wrong side ---
-   if((dir==1 && tp<=entry) || (dir==-1 && tp>=entry))
-      tp=entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
-   double minD=MinStopDist()+_Point;
-   if(dir==1  && tp<entry+minD) tp=entry+minD;
-   if(dir==-1 && tp>entry-minD) tp=entry-minD;
-   return(NormPrice(tp));
+   //--- SPEC AUDIT: ALL take-profit targets removed. Campaigns complete on ownership transfer /
+   //  terminal-sequence completion / P2 CHOCH — not on an arbitrary RR or price level.
+   //  Return 0 = no broker-side TP (the position lives until the engine closes it or SL hits). ---
+   (void)dir; (void)entry; (void)sl;
+   return(0.0);
 }
 
 //--- SYMPHONY ENTRY MECHANISM (ported): the precise "WHEN". On the closed chart bar, require a
@@ -3865,7 +3825,6 @@ void TryEnter()
       if(cur_invInvalidated){ gEntryBlock="invalidated"; return; }
    }
    if(!SessionOK()){ gEntryBlock="session closed"; return; }
-   if(gHalted){ gEntryBlock="halted (daily loss)"; return; }
    int _maxTrades=(InpSmallAccount && InpSmallAcctMaxTrades>0)
                   ? (InpMaxTradesPerDay>0? MathMin(InpMaxTradesPerDay,InpSmallAcctMaxTrades) : InpSmallAcctMaxTrades)
                   : InpMaxTradesPerDay;
@@ -3876,7 +3835,6 @@ void TryEnter()
    if(ownDir!=0 && ownDir!=dir){
       if(OwnYoungerThan(InpMinHoldBars)){ gEntryBlock="hold (young pos, no flip)"; return; }   // don't flip a fresh trade
       if(InpReverseOnOpposite){ if(InpDebugExits) Print("=== FLIP  closing ",(ownDir==1?"BUY":"SELL")," to reverse into ",(dir==1?"BUY":"SELL"),"  (owner ",cur_curveOwner," ",f_waveDirLabel(cur_ownerDir),", thesis ",(ConsensusBias()==1?"BULL":ConsensusBias()==-1?"BEAR":"neutral"),")"); CloseOwnPositions(0); DeletePendingOrders(); }
-      else if(InpExitOnOpposite){ if(InpDebugExits) Print("=== EXIT  opposite-signal partial-flip: closing ",(ownDir==1?"BUY":"SELL")); CloseOwnPositions(-dir); }
       else { gEntryBlock="opposite pos open"; return; }
    }
    if(CountOwnPositions()>=InpMaxPositions){ gEntryBlock="max positions"; return; }
@@ -3890,12 +3848,6 @@ void TryEnter()
    double slBase=ComputeStructureSL(dir,entry,fuEntry,mtfEntry);   // F72: stop BEYOND the actual structure price is reacting off
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);
-   //--- F72 RR FLOOR: a terminal entry must have room for at least InpMinEntryRR (kills the RR<1 bleed) ---
-   if(InpMinEntryRR>0.0){
-      double _riskF=MathAbs(entry-slBase);
-      double _rrF=_riskF>0?MathAbs(tp-entry)/_riskF:0.0;
-      if(_rrF<InpMinEntryRR){ gEntryBlock="RR "+DoubleToString(_rrF,2)+" < min "+DoubleToString(InpMinEntryRR,2)+" (no room)"; return; }
-   }
    //--- LIVE: don't send an order the account can't safely afford ---
    if(!MarginOK(dir,lot,entry)){ gEntryBlock="insufficient free margin / margin level unsafe"; return; }
    //--- SMALL ACCOUNT: the broker minimum lot may force more risk than allowed (can't size smaller) -> skip ---
@@ -3970,23 +3922,8 @@ void TryEnter()
             double psl=PositionGetDouble(POSITION_SL);
             double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
             double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
-            double _minD =MinStopDist()+_Point;
-            double _tp1net=!naf(ctx_netTarget)?ctx_netTarget:ctx_attractorPx;   // FU/Network target for partial
-            //--- recursion-size-aware partial: bank sooner when compressed (move is quick) ---
-            if(!naf(_tp1net)){ double pf=PartialFrac(); _tp1net=_openP+(_tp1net-_openP)*pf; }
-            //--- VALIDATE the partial target: it MUST sit on the PROFIT side of entry by a
-            //    meaningful distance (>= broker min stop AND >= 0.20R).  Otherwise an
-            //    attractor that is behind / on top of price makes the 50% partial fire the
-            //    instant the trade opens (the "buy 2.5 close #x at the same timestamp as the
-            //    open" bug).  Fall back to a clean 1R partial; if even that is invalid, store
-            //    NA so the partial is simply disabled for this trade. ---
-            double _need=MathMax(_minD,0.20*_risk);
-            bool   _tp1ok=(!naf(_tp1net)) && (dir==1 ? _tp1net>=_openP+_need : _tp1net<=_openP-_need);
-            if(!_tp1ok){
-               double _fb=_openP+(dir==1? _risk : -_risk);                        // 1R fallback
-               _tp1net=(dir==1 ? (_fb>=_openP+_need?_fb:NA) : (_fb<=_openP-_need?_fb:NA));
-            }
-            MgRegister(pt,psl,_tp1net,dir);
+            //--- SPEC AUDIT: no TP1/partial registration. Position registered for SL tracking only. ---
+            MgRegister(pt,psl,NA,dir);
             break;
          }
       }
@@ -4030,7 +3967,24 @@ bool MktClosed()
 }
 void ManagePositions()
 {
-   if(gMktClosed) return;                 // market is closed -> skip all discretionary order actions until the next bar (server SL/TP still active)
+   if(gMktClosed) return;
+   //==================================================================
+   // F72 RECURSIVE CURVE OWNERSHIP ENGINE — CAMPAIGN MANAGEMENT
+   //==================================================================
+   // SPEC AUDIT: ALL artificial exits removed (TP/BE/trailing/session/thesis-flip/partial/
+   // life-score/narrative/phase-flip/opposite-signal). Recursive waves naturally contain
+   // pullbacks, internal liquidation, and ownership oscillation — these are NORMAL.
+   //
+   // EXIT ONLY on:
+   // 1) OWNERSHIP TRANSFER — the opposing curve now dominates (new curve > InpOwnerTransferThresh %)
+   // 2) TERMINAL SEQUENCE COMPLETION — the campaign's S/D transition completed (ctx_termComplete
+   //    AND the owner is no longer the trade direction AND transfer is confirmed)
+   // 3) PHASE-2 CHOCH AGAINST POSITION — internal structure proves campaign failure (an
+   //    opposite-direction CHoCH on the owner rung while the campaign is in Transition)
+   //
+   // The position lives until one of these triggers OR the structure SL (hard stop on the broker
+   // server, placed at the entry's actual invalidation). No price target, no time limit.
+   //==================================================================
    double atr=cur_atr; if(atr<=0) atr=10*_Point;
    for(int q=PositionsTotal()-1;q>=0;q--){
       ulong tk=PositionGetTicket(q);
@@ -4039,96 +3993,64 @@ void ManagePositions()
       int    dir   =PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1;
       double openP =PositionGetDouble(POSITION_PRICE_OPEN);
       double curSL =PositionGetDouble(POSITION_SL);
-      double curTP =PositionGetDouble(POSITION_TP);
-      double vol   =PositionGetDouble(POSITION_VOLUME);
       sym.RefreshRates();
       double mkt   =(dir==1?sym.Bid():sym.Ask());
       int    mi    =MgIndex(tk);
       double initSL=(mi>=0?gMgInitSL[mi]:curSL);
-      double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;   // unregistered/zero SL -> use ATR so BE & trailing still engage
+      double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;
       double rMult =(dir==1?(mkt-openP):(openP-mkt))/risk;
 
-      //--- bars this position has been open (gate discretionary exits) ---
+      //--- minimum hold gate: never exit on the entry bar (noise) ---
       int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
-      bool canSoftExit=(heldBars>=InpMinHoldBars);
-      //--- always-on protective exits (broker SL/TP also always active) ---
-      if(InpCloseAtSessEnd && !SessionOK()){ DbgExit("session-end",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      //--- discretionary exits: only after the minimum hold (stops cutting straight away) ---
-      //--- while the dominant thesis still backs this trade, HOLD through opposite blips ---
-      int  cbHold=ConsensusBias();
-      bool thesisSupports=(InpHoldWithThesis && cbHold!=0 && cbHold==dir);
-      //--- THESIS FLIP: the panel's bias has turned against this open trade -> close it
-      //--- (this is what removes a lingering short while the panel now reads "Bullish ...", and vice versa) ---
-      if(canSoftExit && InpExitOnThesisFlip && cbHold!=0 && cbHold!=dir){ DbgExit("thesis-flip (bias turned "+(cbHold==1?"BULL":"BEAR")+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      if(canSoftExit && !thesisSupports){
-         if(InpExitOnInvalid && cur_invInvalidated){ DbgExit("invalidated (active stop broken)",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         if(InpExitOnPhaseFlip && (cur_ie1aPhase=="Absorption"||cur_ie1aPhase=="Retracement")){ DbgExit("phase-flip ("+cur_ie1aPhase+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         if(InpExitOnOpposite && ((dir==1&&cur_shortSignal)||(dir==-1&&cur_longSignal))){ DbgExit("opposite signal printed",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-      }
-      //--- LIFE-SCORE MANAGEMENT: only ever act on a trade that is DEEP IN PROFIT (>=1R) and
-      //  past the minimum hold - NEVER around the entry zone or on a just-opened trade. The life
-      //  score dips constantly near entry / mid-build, so using it there was closing trades at or
-      //  near the open. It is a WINNER-management tool (lock/exit a profitable trade whose curve
-      //  has died), not an entry-zone filter. ---
-      bool lifeMgmtOK=(canSoftExit && rMult>=1.0);
-      if(lifeMgmtOK){
-         //--- v60 curve-life exit: close when the curve in our direction goes DEAD ---
-         if(InpUseV60Context && InpUseCurveLifeExit && ctx_life<=InpCurveDeadBelow && dir==ctx_waveDir){ DbgExit("curve-life dead (life "+DoubleToString(ctx_life,0)+"<="+IntegerToString((int)InpCurveDeadBelow)+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-         //--- v60 narrative management: decayed chain -> exit; fading story -> lock to break-even ---
-         if(InpUseV60Context && InpUseNarrativeMgmt && dir==ctx_waveDir){
-            if(ctx_chainVitality<=InpChainExitBelow){ DbgExit("chain decayed (vit "+DoubleToString(ctx_chainVitality,0)+"<="+IntegerToString((int)InpChainExitBelow)+")",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
-            if(ctx_narrState=="WEAKENING" && !ctx_converging){
-               double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-               bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
-               if(improve && trade.PositionModify(tk,be,curTP)){ DbgMod("narr-weakening->BE",tk,dir,curSL,be,mkt); if(mi>=0) gMgBEDone[mi]=true; curSL=be; }
-            }
+      if(heldBars<InpMinHoldBars) continue;
+
+      //--- EXIT 1: OWNERSHIP TRANSFER — the curve that owns price has fully transferred
+      //  to the opposing direction. This means the campaign we entered is no longer dominant;
+      //  a new campaign in the opposite direction has taken over. ---
+      if(InpExitOnOwnerTransfer){
+         bool ownerOpposed=(cur_ownerDir!=0 && cur_ownerDir!=dir);
+         bool domHigh=(cur_domTransfer>=InpOwnerTransferThresh);
+         if(ownerOpposed && domHigh){
+            DbgExit("ownership-transfer (owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+" dom "+DoubleToString(cur_domTransfer,0)+"%)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
       }
 
-      //--- partial close at TP1 (hold-gated: never trim a brand-new trade) ---
-      if(InpUsePartial && canSoftExit && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
-         bool hit=(dir==1? mkt>=gMgTP1[mi] : mkt<=gMgTP1[mi]);
-         if(hit){
-            double closeVol=NormalizeLot(vol*InpPartialPct/100.0);
-            if(closeVol>0 && closeVol<vol){
-               if(trade.PositionClosePartial(tk,closeVol)){ gMgPartialDone[mi]=true;
-                  DbgExit("partial TP1 ("+IntegerToString((int)InpPartialPct)+"% @"+DoubleToString(gMgTP1[mi],_Digits)+")",tk,dir,openP,mkt,rMult);
-                  if(InpMoveBEAfterTP1){ double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-                     if((dir==1&&be>curSL)||(dir==-1&&(curSL==0||be<curSL))){ trade.PositionModify(tk,be,curTP); DbgMod("post-TP1->BE",tk,dir,curSL,be,mkt); } gMgBEDone[mi]=true; }
-               }
-               else if(MktClosed()) return;   // market shut at the TP1 touch -> stop retrying every tick (this was the #15 storm)
-            }
+      //--- EXIT 2: TERMINAL SEQUENCE COMPLETION — the campaign naturally reached its
+      //  supply/demand terminal and the transition is complete. The campaign is finished;
+      //  the ownership engine says the curve has delivered its full objective. ---
+      if(InpExitOnTermComplete){
+         bool termDone=(InpUseV60Context && ctx_termComplete);
+         //  Only fire this exit if the terminal sequence belongs to the OPPOSING campaign
+         //  (i.e., the ENTRY campaign's curve has been consumed and a new terminal against
+         //  it has matured). If the terminal is in OUR direction, it's our entry zone forming — hold.
+         bool termAgainstUs=(termDone && cur_ownerDir!=0 && cur_ownerDir!=dir);
+         if(termAgainstUs){
+            DbgExit("terminal-sequence-complete (campaign finished, owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+")",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
       }
 
-      //--- profit zone gate: BE + trailing only kick in after 3R OR 900 ticks (whichever first) ---
-      double profitPts =(dir==1?(mkt-openP):(openP-mkt))/_Point;
-      bool   inProfitZone=(rMult>=InpBETriggerRR || profitPts>=InpBETriggerPoints);
-
-      //--- break-even ---
-      if(InpUseBreakeven && inProfitZone && (mi<0||!gMgBEDone[mi])){
-         double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
-         bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
-         if(improve && trade.PositionModify(tk,be,curTP)){ DbgMod("break-even (R "+DoubleToString(rMult,2)+")",tk,dir,curSL,be,mkt); if(mi>=0) gMgBEDone[mi]=true; curSL=be; }
-         else if(improve && MktClosed()) return;
-      }
-
-      //--- trailing (only once we're in the profit zone, so we never trail a fresh trade out) ---
-      if(InpUseTrailing && inProfitZone){
-         double dist=(InpTrailMode==TRAIL_ATR?atr*InpTrailAtrMult:InpTrailPoints*_Point);
-         double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
-         double newSL=(dir==1? mkt-dist : mkt+dist);
-         if(InpUseV60Context && InpUseMigrationTrail && ctx_cpState=="PERSISTING" && dir==ctx_waveDir && !naf(ctx_mig618)){
-            double m=ctx_mig618;
-            if((dir==1 && m<mkt) || (dir==-1 && m>mkt)) newSL=m;   // defend the migrated 0.618 band
+      //--- EXIT 3: PHASE-2 CHOCH AGAINST POSITION — internal structure has broken against
+      //  the campaign. This is a confirmed failure: the campaign tried to expand but the
+      //  opposing wave printed a CHoCH on the owner rung (or higher), proving the campaign
+      //  cannot hold. Requires confirmation bars to filter noise. ---
+      if(InpExitOnP2CHOCH){
+         //  A Phase-2 CHOCH = the owner curve's transition state is "BUILDING" or "EXPANSION"
+         //  (it tried to push in our direction) but the owner direction has FLIPPED against us.
+         //  The cur_transState being early ("BUILDING"/"EXPANSION") while the owner opposes us
+         //  means the structure just broke. Combined with sufficient bars, this is confirmed.
+         bool ownerFlipped=(cur_ownerDir!=0 && cur_ownerDir!=dir);
+         bool earlyTrans=(cur_transState=="BUILDING" || cur_transState=="EXPANSION");
+         //  Additional confirmation: the wave direction on the owner timeframe must also oppose.
+         bool waveConfirm=(ctx_waveDir!=0 && ctx_waveDir!=dir);
+         if(ownerFlipped && earlyTrans && waveConfirm && heldBars>=InpMinHoldBars+InpP2CHOCHConfirmBars){
+            DbgExit("P2-CHOCH-against (owner flipped to "+f_waveDirLabel(cur_ownerDir)+" trans="+cur_transState+", campaign failed)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return;
+            continue;
          }
-         newSL=NormPrice(newSL);
-         double step=InpTrailStepPoints*_Point;
-         bool improve=(dir==1?(newSL>curSL+step):(curSL==0||newSL<curSL-step));
-         // never trail to the losing side of entry before BE
-         if(dir==1 && newSL<openP && !(mi>=0&&gMgBEDone[mi])) improve=improve&&false;
-         if(dir==-1&& newSL>openP && !(mi>=0&&gMgBEDone[mi])) improve=improve&&false;
-         if(improve){ if(trade.PositionModify(tk,newSL,curTP)) DbgMod((InpUseMigrationTrail&&ctx_cpState=="PERSISTING"?"trail-migration618":"trail"),tk,dir,curSL,newSL,mkt); else if(MktClosed()) return; }
       }
    }
 }
@@ -4201,7 +4123,7 @@ void ShowStatus()
    s+="Opp    : "+cur_oppState+" "+R0(cur_oppProgress)+"%   ERF gate "+(cur_erfEntryGate?"OPEN":"SHUT")+"\n";
    s+="Stop   : "+PXs(cur_invActiveStop)+(cur_invInvalidated?" [INVALID]":"")+"   Target "+PXs(!naf(ctx_netTarget)?ctx_netTarget:ctx_attractorPx)+"\n";
    s+="Dest   : "+cur_tplWinnerClass+" "+PXs(cur_tplMainTarget)+" ("+cur_tplSource+")\n";
-   s+="Pos    : "+IntegerToString(CountOwnPositions())+"   TradesToday "+IntegerToString(gTradesToday)+(gHalted?"  [HALTED]":"")+"\n";
+   s+="Pos    : "+IntegerToString(CountOwnPositions())+"   TradesToday "+IntegerToString(gTradesToday)+"\n";
    s+="Gate   : "+gEntryBlock+"\n";
    s+="Curve  : own "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+"  "+cur_transState+"  ["+cur_entryReady+"]\n";
    s+="Recur  : dom "+R0(cur_domTransfer)+"%  comp "+cur_compRegime+"  depth "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth)+(cur_mtfEntryFresh?("  | RET "+cur_mtfEntryTF+" "+(cur_mtfEntryDir==1?"L":"S")+" dom "+R0(cur_mtfEntryDom)+"%"):"")+"\n";
