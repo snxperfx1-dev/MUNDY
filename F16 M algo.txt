@@ -3258,6 +3258,11 @@ input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme c
 //  SPEC AUDIT: InpMinEntryRR REMOVED (was testing against a TP target that no longer exists; campaigns have no RR ceiling)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
+input group "Letra37 EA - F72 v6 Ownership Gate (who owns price)"
+input bool   InpUseOwnershipGate     = true;  // v6: gate entries on the symmetric Ownership Resolver (BUILDING vs ENTRY_CYCLE). The keystone fix - only act once the recursive transition has completed and the new wave owns price (works at tops AND bottoms)
+input bool   InpOwnGateBlockBuilding = true;  // Suppress entries while the owner curve is still BUILDING / first-strike (kills the range-top chop). A fast spring still bypasses
+input bool   InpOwnGateRangeStrict   = true;  // In RANGEBOUND destinations only take a TERMINAL entry-cycle at the extreme (no mid-range returns)
+
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
 input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
 input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
@@ -3479,6 +3484,8 @@ int OnInit()
                (InpExitOnTermComplete?"on":"off"),
                (InpExitOnP2CHOCH?"on":"off"),InpP2CHOCHConfirmBars,
                (InpUseExhaustionExit?"on":"off"));
+   PrintFormat("    OWNGATE: %s  blockBuilding=%s  rangeStrict=%s  (v6 who-owns-price entry gate)",
+               (InpUseOwnershipGate?"ON":"OFF"),(InpOwnGateBlockBuilding?"y":"n"),(InpOwnGateRangeStrict?"y":"n"));
    PrintFormat("    PROFGRD: %s  $%.0f/%.0f/%.0f/%.0f/%.0f -> %.0f/%.0f/%.0f/%.0f/%.0f%% off  BE@T1=%s  trail@T3+=%s",
                (InpUseProfitGuard?"ON":"OFF"),
                InpPG_Tier1USD,InpPG_Tier2USD,InpPG_Tier3USD,InpPG_Tier4USD,InpPG_Tier5USD,
@@ -3904,8 +3911,15 @@ void TryEnter()
    //  at the flip with the shift sequence done / failure-swing). At that point we are MEANT to
    //  trade the NEW curve even though the OLD owner/consensus still reads the prior direction -
    //  that reversal IS the trade, so it must NOT be vetoed.
+   //  v6: the symmetric Ownership Resolver verdict is the authoritative "entry cycle has begun"
+   //  signal (works at tops AND bottoms, independent of the lagging netBias). ENTRY_CYCLE means
+   //  a recursive transition COMPLETED and a new wave took control - that legitimizes the entry
+   //  (including a reversal against the old owner), so it counts as a terminal entry. It is a
+   //  TIMING verdict; the trade DIRECTION is set by the trigger (FU/MTF/arrow), not by this.
+   bool _ownEntry = (cur_ownVerdict=="ENTRY_CYCLE");
    bool _terminalEntry = (cur_entryReady=="Entry Active") || _freshRet
-                      || (_atFlipNow && _shiftsOK) || _fast || (_ctxOn && ctx_termComplete);
+                      || (_atFlipNow && _shiftsOK) || _fast || (_ctxOn && ctx_termComplete)
+                      || _ownEntry;
    //  WITH-CURVE = aligned with the live owning curve (continuation - riding the dominant move).
    bool _withCurve = (cur_ownerDir!=0 && dir==cur_ownerDir);
 
@@ -3923,6 +3937,33 @@ void TryEnter()
    if(InpRequireEntryCycle){
       bool _cycleOK = _withCurve || _terminalEntry;
       if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
+   }
+   //--- F72 v6 OWNERSHIP GATE — "which curve owns price, and is this BUILDING or the ENTRY CYCLE?"
+   //  The symmetric Ownership Resolver (ResolveOwnership) is the authoritative decision: it tracks
+   //  the recursive transition at the high/low and at the S/D zone (recursion depth + dominance
+   //  transfer + compression), independent of the lagging HTF bias. We only ACT once the recursive
+   //  wave has taken control (ENTRY_CYCLE); while still BUILDING (first strike / mid-negotiation)
+   //  we wait — this is what kills the range-top chop and stops boarding before the transition
+   //  completes. A fast Extreme-compression / failure-swing spring still bypasses (never miss it). ---
+   if(InpUseOwnershipGate){
+      bool _spring=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
+      bool _entryCycle=(cur_ownVerdict=="ENTRY_CYCLE");
+      //  (a) first-strike suppression (the keystone): do NOT enter while the owner curve is still
+      //  BUILDING — the recursive transition has not completed, so a trigger here is a first strike
+      //  into the zone (this is the range-top chop and the too-early breakout). Wait for the
+      //  transition to complete (ENTRY_CYCLE). A fast spring bypasses. This is a TIMING gate only;
+      //  direction is already set by the trigger above. ---
+      if(InpOwnGateBlockBuilding && !_entryCycle && !_spring){
+         gEntryBlock="BUILDING (first strike): owner "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)
+                    +"  new "+DoubleToString(cur_newWaveOwn,0)+"%  rec "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_recExpected)
+                    +" ("+cur_transClass+")";
+         return;
+      }
+      //  (b) rangebound: only take a terminal entry cycle at the range extreme, never mid-range ---
+      if(InpOwnGateRangeStrict && cur_tplSource=="RANGEBOUND" && cur_transClass!="Terminal" && !_spring){
+         gEntryBlock="rangebound: await terminal entry-cycle at the extreme (now "+cur_transClass+"/"+cur_ownVerdict+")";
+         return;
+      }
    }
    //--- SYMPHONY precise trigger: enter on the TURN (closed-bar momentum inflection at the right
    //  retrace depth, inducement complete) - the "exactly WHEN" on top of the context "WHETHER". ---
@@ -4026,6 +4067,7 @@ void TryEnter()
                " aggr=",(aggressive?"Y":"n"));
          Print("    OWNER   : ",cur_curveOwner," ",(cur_ownerDir==1?"Bull":cur_ownerDir==-1?"Bear":"Flat"),
                "  trans=",cur_transState,"  camp=",ctx_campaign,"  atFlip=",(ctx_atFlip?"Y":"n"),"  ready=",cur_entryReady);
+         Print("    OWNS    : ",cur_ownVerdict,"  [",cur_transClass,"]  new ",DoubleToString(cur_newWaveOwn,0),"% vs old ",DoubleToString(cur_oldWaveOwn,0),"%  rec ",IntegerToString(cur_recDepth),"/",IntegerToString(cur_recExpected),"  side ",f_waveDirLabel(cur_ownerDir));
          Print("    RECUR   : dom=",DoubleToString(cur_domTransfer,0),"%  comp=",cur_compRegime,
                "  depth=",cur_recDepth,"/",cur_expRecDepth,"  budget=",DoubleToString(cur_curveBudget,0),"%  toFlip=",DoubleToString(cur_distFlipAtr,1),"ATR  entryP=",DoubleToString(cur_entryProb,0),"%");
          Print("    TERMINAL: shifts=",ctx_termShifts,"/",ctx_termExpected,"  m1=",ctx_termM1Cycles,"  done=",(ctx_termComplete?"Y":"n"),
