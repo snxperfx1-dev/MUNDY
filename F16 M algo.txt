@@ -3214,16 +3214,13 @@ input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme c
 input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
-input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion / Risk)"
+input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
 input double InpAnchorBufATR      = 0.25;  // STOP buffer beyond the curve-origin / invalidation level (xATR) - SYMPHONY-tight
 input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
 input double InpArcExtMult        = 1.5;   // ARC extension: apex = leg origin + leg*this (the projected curve apex)
 input double InpArcConvPower      = 1.5;   // ARC convexity power (time-curvature of the projected path)
 input bool   InpUseExhaustionExit = true;  // Composite EXIT: close on ARC-apex + wave/phase collapse + sweep-reclaim (terminal exhaustion)
 input double InpArcTolATR         = 0.20;  // How close to the ARC apex counts as "reached" (xATR)
-input bool   InpUseRiskThrottle   = true;  // DRDWCT-lite: vol-scaled risk + risk-density lot cap + block-new on open-risk breach
-input double InpRDLimit           = 3.0;   // Risk-density cap: max lots PER ATR of stop distance (only bites a sub-ATR micro-stop; normal structure stops are never clamped)
-input double InpMaxOpenRiskPct    = 6.0;   // Block NEW entries when open positions' risk-to-SL exceeds this % of equity
 
 input group "Letra37 EA - SYMPHONY Entry Trigger (precise 'when')"
 input bool   InpUseSymphonyTrigger = true; // Require the SYMPHONY EVENT trigger: enter on the closed-bar momentum inflection (the turn), not just on a true state
@@ -3300,45 +3297,12 @@ double MoneyPerPointPerLot()
 double CalcLot(const double entry,const double sl)
 {
    if(InpLotMode==LOT_FIXED) return(NormalizeLot(InpFixedLot));
-   double riskPct=InpRiskPercent;
-   //--- vol-regime scale (DRDWCT-style): when current ATR is elevated vs its 20-bar mean, cut
-   //  risk - the market is wilder so size down. ---
-   if(InpUseRiskThrottle && cur_volRatio>1.0)
-      riskPct *= clamp(1.0/cur_volRatio, 0.5, 1.0);
-   double riskMoney=gAccount.Equity()*riskPct/100.0;
+   double riskMoney=gAccount.Equity()*InpRiskPercent/100.0;   // pure risk-% sizing (no vol-scaling / RD throttle)
    double slPts=MathAbs(entry-sl)/_Point;
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
    double lot=riskMoney/(slPts*mpp);
-   //--- RD "micro-bomb" cap (DRDWCT): a PATHOLOGICALLY tight stop must not create an oversized
-   //  lot (gap/slippage risk). Expressed in ATR units so it is broker-digit independent: allow
-   //  at most InpRDLimit lots PER ATR of stop distance. A normal structure stop (>=~1 ATR) is
-   //  NEVER clamped; only a sub-ATR micro-stop is. (The old price-unit form clamped normal gold
-   //  stops down to the 0.01 minimum lot - that was the "tiny lots" bug.) ---
-   if(InpUseRiskThrottle && InpRDLimit>0.0){
-      double atrPx =(cur_atr>0?cur_atr:10*_Point);
-      double stopAtr=MathAbs(entry-sl)/atrPx;          // stop distance measured in ATRs
-      if(stopAtr>0.0){ double rdCap=InpRDLimit*stopAtr; if(lot>rdCap) lot=rdCap; }
-   }
-   return(NormalizeLot(lot));
-}
-
-//--- DRDWCT-lite: total open risk-to-SL of own positions as a % of equity (book heat) ---
-double OpenRiskFrac()
-{
-   double eq=gAccount.Equity(); if(eq<=0) return(0.0);
-   double mpp=MoneyPerPointPerLot(); if(mpp<=0) return(0.0);
-   double tot=0.0;
-   for(int q=PositionsTotal()-1;q>=0;q--){
-      ulong tk=PositionGetTicket(q); if(tk==0) continue;
-      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
-      double op =PositionGetDouble(POSITION_PRICE_OPEN);
-      double psl=PositionGetDouble(POSITION_SL);
-      double vol=PositionGetDouble(POSITION_VOLUME);
-      if(psl<=0.0) continue;
-      tot += (MathAbs(op-psl)/_Point)*mpp*vol;
-   }
-   return(tot/eq*100.0);
+   return(NormalizeLot(lot));                                 // NormalizeLot enforces broker min/step and the InpMaxLot cap
 }
 
 //--- ARC v2 apex builder (SYMPHONY port): uses the ARC inputs (declared in the EA section) and
@@ -3835,12 +3799,6 @@ void TryEnter()
    if(gHalted){ gEntryBlock="halted (daily loss)"; return; }
    if(InpMaxTradesPerDay>0 && gTradesToday>=InpMaxTradesPerDay){ gEntryBlock="max trades/day"; return; }
    if(InpMaxSpreadPoints>0){ long sp=(long)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(sp>InpMaxSpreadPoints){ gEntryBlock="spread "+IntegerToString((int)sp); return; } }
-   //--- DRDWCT-lite risk throttle: block a NEW entry when the book's open risk-to-SL is already
-   //  over the equity budget (stops stacking risk on an already-hot book). ---
-   if(InpUseRiskThrottle && InpMaxOpenRiskPct>0.0){
-      double _openRisk=OpenRiskFrac();
-      if(_openRisk>=InpMaxOpenRiskPct){ gEntryBlock="risk throttle: open risk "+DoubleToString(_openRisk,1)+"% >= "+DoubleToString(InpMaxOpenRiskPct,1)+"%"; return; }
-   }
 
    int ownDir=OwnPositionDir();
    if(ownDir!=0 && ownDir!=dir){
@@ -4148,7 +4106,7 @@ void ShowStatus()
    s+="Curve  : own "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+"  "+cur_transState+"  ["+cur_entryReady+"]\n";
    s+="Recur  : dom "+R0(cur_domTransfer)+"%  comp "+cur_compRegime+"  depth "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth)+(cur_mtfEntryFresh?("  | RET "+cur_mtfEntryTF+" "+(cur_mtfEntryDir==1?"L":"S")+" dom "+R0(cur_mtfEntryDom)+"%"):"")+"\n";
    s+="Cap    : budget "+R0(cur_curveBudget)+"%  toFlip "+DoubleToString(cur_distFlipAtr,1)+"ATR  entryP "+R0(cur_entryProb)+"%\n";
-   s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"  openRisk "+DoubleToString(OpenRiskFrac(),1)+"%\n";
+   s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"\n";
    if(InpUseV60Context) s+="Camp   : "+ctx_campaign+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
    if(InpUseV60Context) s+="Induc  : "+(ctx_failureSwing?"FAILURE SWING (spring) - ":"")+(ctx_atTrueInduction?"TRUE INDUCTION (lowest flip "+PXs(ctx_lowestFlip)+")":ctx_inManipBand?"MANIPULATION band 0.618-0.786 (wait)":"-")+"\n";
    s+="Narr   : "+cur_cmdNarrative;
