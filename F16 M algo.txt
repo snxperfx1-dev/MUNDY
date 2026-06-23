@@ -3560,10 +3560,10 @@ double ComputeSL(const int dir,const double entry)
    return(NormPrice(sl));
 }
 
-//--- F72: place the stop just BEYOND the actual STRUCTURE price is reacting off.
-//  priority: true-induction lowest flip (the real S/D) -> the owning rung's invalidation
-//  -> the FU wick tip -> the engine's structural invalidation -> recent key swing.
-//  Then fold in the key swing, enforce broker min + ATR floor, and the ATR safety cap.
+//--- F72: place the stop JUST beyond the actual STRUCTURE price is reacting off — tight to
+//  the level, not widened out. priority: true-induction lowest flip (the real S/D) -> the
+//  owning rung's invalidation -> the FU wick tip -> the engine's structural invalidation.
+//  Only when NO structure is found do we fall back to the ATR/key-swing stop. ATR cap always.
 double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,const bool mtfEntry)
 {
    double a=cur_atr; if(a<=0) a=10*_Point;
@@ -3575,14 +3575,17 @@ double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,co
       else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))             lvl=ctx_fuTip;           // beyond the FU wick extreme
       else if(!naf(cur_invActiveStop))                                    lvl=cur_invActiveStop;   // engine structural invalidation
    }
-   double sl;
-   if(!naf(lvl)) sl=lvl + (dir==1? -buf : buf);
-   else          sl=ComputeSL(dir,entry);                                  // fall back to engine/ATR/key-swing path
-   //--- fold in the recent key swing high/low (take whichever protects more) ---
-   double ks=KeyLevelStop(dir,entry);
-   if(ks!=0.0){ if(dir==1) sl=MathMin(sl,ks); else sl=MathMax(sl,ks); }
-   //--- enforce side + broker min + ATR floor, then the ATR safety cap ---
-   double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
+   double sl; bool haveLvl=!naf(lvl);
+   if(haveLvl) sl=lvl + (dir==1? -buf : buf);                              // stop sits JUST beyond the actual structure level
+   else        sl=ComputeSL(dir,entry);                                    // no structure -> engine/ATR/key-swing fallback
+   //--- only when there is NO real structure do we widen out to the recent key swing ---
+   if(!haveLvl){
+      double ks=KeyLevelStop(dir,entry);
+      if(ks!=0.0){ if(dir==1) sl=MathMin(sl,ks); else sl=MathMax(sl,ks); }
+   }
+   //--- min distance: ON STRUCTURE = broker-min + wick buffer only (stays tight to the level);
+   //--- OFF STRUCTURE = the wider ATR floor so a fallback stop is not razor-thin. ---
+   double minD = haveLvl ? (MinStopDist()+buf) : MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
    if(dir==1  && sl>entry-minD) sl=entry-minD;
    if(dir==-1 && sl<entry+minD) sl=entry+minD;
    double maxD=InpMaxSLAtr*a;
@@ -3640,7 +3643,8 @@ void TryEnter()
       bool _okTrue  = (!InpRequireTrueInduction || !_ctx || ctx_atTrueInduction);
       bool _okFlip  = (!InpRequireAtFlip || !_ctx || ctx_atFlip);
       bool _okShift = (InpMinTermShifts<=0 || !_ctx || !ctx_atFlip || ctx_termShifts>=InpMinTermShifts || ctx_failureSwing);
-      bool _okOwner = (!InpOwnerMustAgree || !_ctx || cur_ownerDir==0 || cur_mtfEntryDir==cur_ownerDir);   // ownership-first: follow the owning curve
+      bool _okOwner = (!InpOwnerMustAgree || !_ctx || cur_ownerDir==0 || cur_mtfEntryDir==cur_ownerDir
+                       || cur_mtfEntryDom>=InpMinDomTransfer);   // a Return whose dominance has TRANSFERRED is the new curve -> trade the reversal (don't block it)
       if(cur_mtfEntryDom>=InpMinDomTransfer && cur_entryProb>=InpMinEntryProb && _okFlip && _okShift && _okManip && _okTrue && _okOwner){ dir=cur_mtfEntryDir; aggressive=true; mtfEntry=true; }
       else if(cur_mtfEntryDom<InpMinDomTransfer) gEntryBlock="first strike "+cur_mtfEntryTF+" (dom "+IntegerToString((int)cur_mtfEntryDom)+"% < entry cycle)";
       else if(!_okOwner) gEntryBlock=(cur_mtfEntryDir==1?"long":"short")+" vs owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":"bear");
@@ -3661,31 +3665,36 @@ void TryEnter()
       if(ok){ dir=adir; aggressive=true; }
    }
    if(dir==0){ gEntryBlock=(InpUseV60Context&&InpAggressiveEntry)?"no signal / v60 not aligned":"no signal (awaiting Return)"; return; }
-   //--- UNIFIED counter-bias veto: never trade against the dominant thesis (covers arrows, DOE, aggressive, FU).
-   //--- This is what stops shorts while "Bullish reversal developing" is on the panel. ---
-   if(InpBlockCounterBias){
+   //--- F72 entry-cycle context (computed ONCE, drives the vetoes + the gate below) --------
+   bool _ctxOn=InpUseV60Context;
+   bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
+   int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
+   bool _atFlipNow=(_ctxOn?ctx_atFlip:(cur_distFlipAtr<=1.0));
+   bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
+   bool _freshRet=(cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer);
+   //  TERMINAL entry = the NEW curve has taken control (dominance transferred / Entry Active /
+   //  at the flip with the shift sequence done / failure-swing). At that point we are MEANT to
+   //  trade the NEW curve even though the OLD owner/consensus still reads the prior direction -
+   //  that reversal IS the trade, so it must NOT be vetoed.
+   bool _terminalEntry = (cur_entryReady=="Entry Active") || _freshRet
+                      || (_atFlipNow && _shiftsOK) || _fast || (_ctxOn && ctx_termComplete);
+   //  WITH-CURVE = aligned with the live owning curve (continuation - riding the dominant move).
+   bool _withCurve = (cur_ownerDir!=0 && dir==cur_ownerDir);
+
+   //--- counter-bias veto: blocks RANDOM counter-trend trades, but NEVER a confirmed terminal
+   //--- entry-cycle (that is exactly when we trade the new curve against the old consensus). ---
+   if(InpBlockCounterBias && !_terminalEntry){
       int cb=ConsensusBias();
       if(cb!=0 && dir!=cb){ gEntryBlock=(dir==1?"long":"short")+" vetoed vs "+(cb==1?"BULL":"BEAR")+" thesis"; return; }
    }
-   //--- F72 UNIFIED ENTRY-CYCLE GATE (build-vs-execute) — applies to EVERY source ---------
-   //  Only fire once the entry cycle has begun on the OWNING curve: the recursive wave has
-   //  taken control (Entry Active), OR price is at the flip with >= InpMinTermShifts Wyckoff
-   //  shifts, OR a fresh high-dominance Return printed. Compressed / volatile curves are
-   //  allowed to fire IMMEDIATELY (failure-swing / Extreme compression) so the fast terminal
-   //  sequences are never missed.
+   //--- F72 UNIFIED ENTRY-CYCLE GATE — trade WITH the curve -------------------------------
+   //  Allow the entry when it is either (a) aligned with the live OWNER curve (continuation),
+   //  or (b) a confirmed TERMINAL reversal where the new wave has taken control. Only a
+   //  counter-trend, mid-build entry (neither of those) is blocked. A trigger (arrow / DOE /
+   //  FU / fresh Return) is still required to reach here, so this does not over-trade.
    if(InpRequireEntryCycle){
-      bool _ctxOn=InpUseV60Context;
-      bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
-      int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
-      bool _atFlipNow=(_ctxOn?ctx_atFlip:(cur_distFlipAtr<=1.0));
-      bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
-      bool _cycleOK = (cur_entryReady=="Entry Active")
-                   || (_atFlipNow && _shiftsOK)
-                   || (cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer && _shiftsOK)
-                   || _fast;
-      bool _ownerOK = (!InpOwnerMustAgree || cur_ownerDir==0 || dir==cur_ownerDir);
-      if(!_cycleOK){ gEntryBlock="building, not entry-cycle ("+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+", "+cur_compRegime+" comp)"; return; }
-      if(!_ownerOK){ gEntryBlock=(dir==1?"long":"short")+" vs owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":"bear"); return; }
+      bool _cycleOK = _withCurve || _terminalEntry;
+      if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
    }
    if(!aggressive){
       if(!PassesFilters(dir)) return;          // strict Letra path keeps full filters
