@@ -3214,6 +3214,10 @@ input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme c
 input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
+input group "Letra37 EA - Pure Cycle Management (raw indicator test)"
+input bool   InpCycleExitOnly   = true;    // RAW ENGINE TEST: NO hard TP and NO hard SL on the order. The trade is exited ONLY when the engine detects a TERMINAL REVERSAL at a new high / supply-demand (cycle-managed). Disables all forced TP/SL/trail/BE/partial/exhaustion so you can judge the indicator alone.
+input bool   InpCycleExitOnDomTransfer = true; // Also exit when dominance transfers to a fresh OPPOSITE curve (the new curve has taken ownership)
+
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
 input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
 input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
@@ -3821,7 +3825,8 @@ void TryEnter()
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);
    //--- F72 RR FLOOR: a terminal entry must have room for at least InpMinEntryRR (kills the RR<1 bleed) ---
-   if(InpMinEntryRR>0.0){
+   //  Skipped in pure-cycle mode (no hard TP target to measure against - exits are cycle-driven). ---
+   if(!InpCycleExitOnly && InpMinEntryRR>0.0){
       double _riskF=MathAbs(entry-slBase);
       double _rrF=_riskF>0?MathAbs(tp-entry)/_riskF:0.0;
       if(_rrF<InpMinEntryRR){ gEntryBlock="RR "+DoubleToString(_rrF,2)+" < min "+DoubleToString(InpMinEntryRR,2)+" (no room)"; return; }
@@ -3832,19 +3837,26 @@ void TryEnter()
    string cmt=InpComment+" "+_trig+" "+cur_tqeGrade;
 
    bool ok=false;
+   //--- pure-cycle mode: send NO hard SL and NO hard TP. slBase/tp are still computed above for
+   //  position SIZING (risk-% off the structure-stop distance) and the debug line, but they are
+   //  NOT attached to the order - the engine's cycle-reversal exit is the only way out. ---
+   double slSend=(InpCycleExitOnly?0.0:slBase);
+   double tpSend=(InpCycleExitOnly?0.0:tp);
    if(InpUseLimitEntry && !naf(cur_doeEntryMid)){
       double lim=NormPrice(cur_doeEntryMid);
       double slL=ComputeStructureSL(dir,lim,fuEntry,mtfEntry);
       double tpL=ComputeTP(dir,lim,slL);
       double lotL=CalcLot(lim,slL);
+      double slLsend=(InpCycleExitOnly?0.0:slL);
+      double tpLsend=(InpCycleExitOnly?0.0:tpL);
       datetime exp=(InpPendingExpiryBars>0)?(TimeCurrent()+(datetime)(InpPendingExpiryBars*PeriodSeconds(_Period))):0;
       ENUM_ORDER_TYPE_TIME tt=(exp>0?ORDER_TIME_SPECIFIED:ORDER_TIME_GTC);
       trade.SetTypeFillingBySymbol(_Symbol);
-      if(dir==1) ok=trade.BuyLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
-      else       ok=trade.SellLimit(lotL,lim,_Symbol,slL,tpL,tt,exp,cmt);
+      if(dir==1) ok=trade.BuyLimit(lotL,lim,_Symbol,slLsend,tpLsend,tt,exp,cmt);
+      else       ok=trade.SellLimit(lotL,lim,_Symbol,slLsend,tpLsend,tt,exp,cmt);
    } else {
-      if(dir==1) ok=trade.Buy(lot,_Symbol,ask,slBase,tp,cmt);
-      else       ok=trade.Sell(lot,_Symbol,bid,slBase,tp,cmt);
+      if(dir==1) ok=trade.Buy(lot,_Symbol,ask,slSend,tpSend,cmt);
+      else       ok=trade.Sell(lot,_Symbol,bid,slSend,tpSend,cmt);
    }
    if(!ok) MktClosed();   // if the entry was rejected because the market is shut, arm the back-off so the same-tick ManagePositions() does not also hammer the broker
    if(ok){
@@ -3962,6 +3974,20 @@ void ManagePositions()
       bool canSoftExit=(heldBars>=InpMinHoldBars);
       //--- always-on protective exits (broker SL/TP also always active) ---
       if(InpCloseAtSessEnd && !SessionOK()){ DbgExit("session-end",tk,dir,openP,mkt,rMult); if(!trade.PositionClose(tk) && MktClosed()) return; continue; }
+      //--- PURE CYCLE EXIT (primary exit when InpCycleExitOnly): with no hard TP/SL on the order,
+      //  the trade is closed ONLY when the engine detects a TERMINAL REVERSAL against it - the
+      //  four-shift terminal sequence has completed and the opposite curve now owns price (a
+      //  reversal at the new high / supply-demand), or dominance has transferred to a fresh
+      //  opposite curve. This is "exit when a reversal is detected at the new high or the
+      //  supply/demand region" with zero forced management. ---
+      if(InpCycleExitOnly && canSoftExit){
+         bool termRev=(InpUseV60Context && ctx_termComplete && ctx_waveDir!=0 && ctx_waveDir!=dir);
+         bool domRev =(InpCycleExitOnDomTransfer && cur_mtfEntryFresh && cur_mtfEntryDir!=0 && cur_mtfEntryDir!=dir && cur_mtfEntryDom>=InpMinDomTransfer);
+         if(termRev || domRev){
+            DbgExit(termRev?"cycle reversal (terminal sequence complete, opposite curve owns)":"cycle reversal (dominance transferred to opposite curve)",tk,dir,openP,mkt,rMult);
+            if(!trade.PositionClose(tk) && MktClosed()) return; continue;
+         }
+      }
       //--- discretionary exits: only after the minimum hold (stops cutting straight away) ---
       //--- while the dominant thesis still backs this trade, HOLD through opposite blips ---
       int  cbHold=ConsensusBias();
@@ -3995,7 +4021,7 @@ void ManagePositions()
       }
 
       //--- partial close at TP1 (hold-gated: never trim a brand-new trade) ---
-      if(InpUsePartial && canSoftExit && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
+      if(InpUsePartial && !InpCycleExitOnly && canSoftExit && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
          bool hit=(dir==1? mkt>=gMgTP1[mi] : mkt<=gMgTP1[mi]);
          if(hit){
             double closeVol=NormalizeLot(vol*InpPartialPct/100.0);
@@ -4015,7 +4041,7 @@ void ManagePositions()
       bool   inProfitZone=(rMult>=InpBETriggerRR || profitPts>=InpBETriggerPoints);
 
       //--- break-even ---
-      if(InpUseBreakeven && inProfitZone && (mi<0||!gMgBEDone[mi])){
+      if(InpUseBreakeven && !InpCycleExitOnly && inProfitZone && (mi<0||!gMgBEDone[mi])){
          double be=openP+(dir==1?InpBEOffsetPoints*_Point:-InpBEOffsetPoints*_Point); be=NormPrice(be);
          bool improve=(dir==1?(be>curSL):(curSL==0||be<curSL));
          if(improve && trade.PositionModify(tk,be,curTP)){ DbgMod("break-even (R "+DoubleToString(rMult,2)+")",tk,dir,curSL,be,mkt); if(mi>=0) gMgBEDone[mi]=true; curSL=be; }
@@ -4023,7 +4049,7 @@ void ManagePositions()
       }
 
       //--- trailing (only once we're in the profit zone, so we never trail a fresh trade out) ---
-      if(InpUseTrailing && inProfitZone){
+      if(InpUseTrailing && !InpCycleExitOnly && inProfitZone){
          double dist=(InpTrailMode==TRAIL_ATR?atr*InpTrailAtrMult:InpTrailPoints*_Point);
          double minD=MinStopDist()+_Point; if(dist<minD) dist=minD;
          double newSL=(dir==1? mkt-dist : mkt+dist);
@@ -4052,6 +4078,7 @@ void ManagePositions()
 //  curve apex instead of cutting early, but still banks before giving it all back. ---
 void ManageExhaustionExit()
 {
+   if(InpCycleExitOnly) return;            // pure-cycle mode: the terminal-reversal cycle exit is the ONLY exit (isolate the engine)
    if(!InpUseExhaustionExit) return;
    if(gMktClosed) return;
    if(CountOwnPositions()<=0) return;
