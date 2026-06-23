@@ -2216,7 +2216,8 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
          double _px    = c[i];
          cur_distFlipAtr = (!naf(_destA))? MathAbs(_px-_destA)/_atr2 : 5.0;
          double _wavelen = fmax2(0.4, 2.0*(1.0-_oc/100.0));          // loop size: low comp ~2 ATR, high comp ~0.4 ATR
-         cur_expRecDepth = (int)fmin2(4.0, fmax2(0.0, MathRound(cur_distFlipAtr/_wavelen)));
+         double _depthCap = (_oc>=80.0)?5.0:4.0;                     // F72: Extreme compression can fit a 5th micro-recursion
+         cur_expRecDepth = (int)fmin2(_depthCap, fmax2(0.0, MathRound(cur_distFlipAtr/_wavelen)));
          cur_curveBudget = fmin2(100.0, cur_distFlipAtr*12.5);        // 8 ATR of room = "full" budget
          cur_transMaturity = cur_domTransfer;                         // dominance transfer % = how mature the transition is
          double _nearFlip = fmax2(0.0, 1.0 - cur_distFlipAtr/3.0);    // 1 at the flip, 0 beyond 3 ATR
@@ -3024,7 +3025,7 @@ void ContextRun(const int bars)
    //  Wyckoff terminal sequence: count recursive change-of-character shifts WHILE inside the
    //  flip zone (the spring/test/LPS1/LPS2 - "always four"). Entry matures on the completing
    //  shift, not the first strike. Compression sets how many shifts to expect (tight -> fewer/faster).
-   int _expShifts=(int)clamp(nz((double)cur_expRecDepth,3.0),2.0,4.0);
+   int _expShifts=(int)clamp(nz((double)cur_expRecDepth,3.0),3.0,5.0);   // F72: Wyckoff terminal is ~4 shifts, min 3
    if(ctx_fuMerged) _expShifts=(int)MathMin(_expShifts+3,7);   // Principle 9: camp merged back -> cycle still owes ~3 more recursions
    if(!ctx_atFlip){ g_termActive=false; g_termShifts=0; ctx_termM1Cycles=0; g_termPrevDirM1=cur_dirM1; }
    else {
@@ -3106,7 +3107,7 @@ input group "Letra37 EA - Risk / Sizing"
 input ENUM_LOT_MODE InpLotMode          = LOT_RISK_PCT; // Position sizing mode
 input double        InpFixedLot         = 0.10;         // Fixed lot (LOT_FIXED)
 input double        InpRiskPercent      = 1.0;          // Risk % of equity (LOT_RISK_PCT)
-input double        InpMaxLot           = 5.0;          // Hard lot cap
+input double        InpMaxLot           = 2.0;          // Hard lot cap (reduced from 5: 5 lots/100k was ~3-5% risk/trade -> 96% DD)
 input int           InpMaxSpreadPoints  = 0;            // Max spread (points); 0=off (gold spreads are large!)
 
 input group "Letra37 EA - Stop Loss"
@@ -3127,12 +3128,12 @@ input double        InpTPrr             = 2.0;          // TP = RR * risk (TP_RR
 input double        InpTPAtrMult        = 3.0;          // TP = ATR * mult (TP_ATR)
 input bool          InpUsePartial       = true;         // Partial close at first target
 input double        InpPartialPct       = 50.0;         // Partial close % at TP1
-input bool          InpMoveBEAfterTP1   = false;        // Move SL to BE after partial (off - BE now uses 3R/900 rule)
+input bool          InpMoveBEAfterTP1   = true;         // Move SL to BE after partial (lock the rest risk-free once TP1 banks)
 
 input group "Letra37 EA - Trade Management"
 input bool          InpUseBreakeven     = true;         // Enable break-even
-input double        InpBETriggerRR      = 3.0;          // BE trigger in RR (also see ticks below)
-input double        InpBETriggerPoints  = 900;         // BE trigger in ticks/points (whichever hits first)
+input double        InpBETriggerRR      = 1.0;          // BE trigger in RR (earlier: winners were giving back before 3R)
+input double        InpBETriggerPoints  = 300;         // BE trigger in ticks/points (whichever hits first)
 input int           InpBEOffsetPoints   = 20;          // BE offset (points, locked profit)
 input bool          InpUseTrailing      = true;         // Enable trailing stop
 input ENUM_TRAIL_MODE InpTrailMode      = TRAIL_ATR;    // Trailing mode
@@ -3144,7 +3145,7 @@ input bool          InpExitOnInvalid    = true;         // Close on engine inval
 input bool          InpExitOnPhaseFlip  = false;        // Close on Absorption/Retracement phase (off - was cutting too early)
 input int           InpMinHoldBars      = 5;            // Min bars to hold before ANY discretionary exit (SL/TP always active)
 input bool          InpHoldWithThesis   = true;         // HOLD a bias-aligned trade through opposite signals while the thesis still supports it
-input bool          InpExitOnThesisFlip = true;         // CLOSE an open trade when the dominant thesis flips against it (keeps the position matching the panel)
+input bool          InpExitOnThesisFlip = false;         // CLOSE an open trade when the dominant thesis flips against it (keeps the position matching the panel)
 
 input group "Letra37 EA - Session / Guards"
 input bool          InpUseSession       = false;        // Restrict trading hours (server time)
@@ -3186,7 +3187,7 @@ input int    InpMinEntryRung     = 1;      // Lowest rung allowed for a multi-TF
 input double InpMinDomTransfer   = 45.0;   // Min dominance-transfer % to treat a Return as an ENTRY CYCLE (below = first strike, wait)
 input double InpMinEntryProb     = 0.0;    // Optional: min entry-cycle probability % to allow a multi-TF entry (0 = off)
 input bool   InpRequireAtFlip    = false;  // Optional: only take multi-TF entries when price is AT the HTF FU flip zone (terminal side)
-input int    InpMinTermShifts    = 0;      // Optional: at the flip zone, require N terminal shifts (Wyckoff ~4) before entering (0 = off)
+input int    InpMinTermShifts    = 3;      // F72: require N terminal shifts (Wyckoff ~4, min 3) before entry; failure-swing / Extreme compression bypasses (fire fast)
 input bool   InpAvoidManipBand   = true;   // Skip entries in the 0.618-0.786 manipulation band (displacement trap) unless at true induction
 input bool   InpRequireTrueInduction = false; // Optional: only enter at the LOWEST flip (true S/D induction zone)
 input bool   InpBlockCounterBias = true;   // VETO any entry (incl. arrows/DOE) opposing the dominant thesis (narrative+DOE+network+wave+stack)
@@ -3198,6 +3199,12 @@ input double InpCurveDeadBelow  = 32.0;    // life <= this => DEAD (close)
 input bool   InpUseMigrationTrail= false;  // Keep stop at ownership-migration 0.618 band while force persists
 input bool   InpUseNarrativeMgmt= false;   // Manage with narrative lineage / chain vitality (OFF - same decay-close problem)
 input double InpChainExitBelow  = 25.0;    // Exit when chain vitality <= this (story decayed across curves)
+
+input group "Letra37 EA - F72 Entry Cycle (curve ownership)"
+input bool   InpRequireEntryCycle = true;  // F72: only enter once the ENTRY CYCLE has begun (build-vs-execute) - applies to ALL sources (arrows/DOE/FU/MTF)
+input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme compression or on a failure-swing (compressed/volatile curves fire fast - never miss them)
+input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
+input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
 //==================================================================
 // EA GLOBALS
@@ -3553,6 +3560,37 @@ double ComputeSL(const int dir,const double entry)
    return(NormPrice(sl));
 }
 
+//--- F72: place the stop just BEYOND the actual STRUCTURE price is reacting off.
+//  priority: true-induction lowest flip (the real S/D) -> the owning rung's invalidation
+//  -> the FU wick tip -> the engine's structural invalidation -> recent key swing.
+//  Then fold in the key swing, enforce broker min + ATR floor, and the ATR safety cap.
+double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,const bool mtfEntry)
+{
+   double a=cur_atr; if(a<=0) a=10*_Point;
+   double buf=InpKeyLevelBufATR*a*gRecSizeMult;
+   double lvl=NA;
+   if(InpStructureStop){
+      if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) lvl=ctx_lowestFlip;     // the true S/D the curve plays off
+      else if(mtfEntry && !naf(cur_mtfEntryInv))                          lvl=cur_mtfEntryInv;     // the owning rung's invalidation
+      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))             lvl=ctx_fuTip;           // beyond the FU wick extreme
+      else if(!naf(cur_invActiveStop))                                    lvl=cur_invActiveStop;   // engine structural invalidation
+   }
+   double sl;
+   if(!naf(lvl)) sl=lvl + (dir==1? -buf : buf);
+   else          sl=ComputeSL(dir,entry);                                  // fall back to engine/ATR/key-swing path
+   //--- fold in the recent key swing high/low (take whichever protects more) ---
+   double ks=KeyLevelStop(dir,entry);
+   if(ks!=0.0){ if(dir==1) sl=MathMin(sl,ks); else sl=MathMax(sl,ks); }
+   //--- enforce side + broker min + ATR floor, then the ATR safety cap ---
+   double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
+   if(dir==1  && sl>entry-minD) sl=entry-minD;
+   if(dir==-1 && sl<entry+minD) sl=entry+minD;
+   double maxD=InpMaxSLAtr*a;
+   if(dir==1  && sl<entry-maxD) sl=entry-maxD;
+   if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
+   return(NormPrice(sl));
+}
+
 double ComputeTP(const int dir,const double entry,const double sl)
 {
    double atr=cur_atr; if(atr<=0) atr=10*_Point;
@@ -3629,6 +3667,26 @@ void TryEnter()
       int cb=ConsensusBias();
       if(cb!=0 && dir!=cb){ gEntryBlock=(dir==1?"long":"short")+" vetoed vs "+(cb==1?"BULL":"BEAR")+" thesis"; return; }
    }
+   //--- F72 UNIFIED ENTRY-CYCLE GATE (build-vs-execute) — applies to EVERY source ---------
+   //  Only fire once the entry cycle has begun on the OWNING curve: the recursive wave has
+   //  taken control (Entry Active), OR price is at the flip with >= InpMinTermShifts Wyckoff
+   //  shifts, OR a fresh high-dominance Return printed. Compressed / volatile curves are
+   //  allowed to fire IMMEDIATELY (failure-swing / Extreme compression) so the fast terminal
+   //  sequences are never missed.
+   if(InpRequireEntryCycle){
+      bool _ctxOn=InpUseV60Context;
+      bool _fast=(InpFastEntryOnComp && (cur_compRegime=="Extreme" || (_ctxOn && ctx_failureSwing)));
+      int  _shiftsNow=(_ctxOn?ctx_termShifts:0);
+      bool _atFlipNow=(_ctxOn?ctx_atFlip:(cur_distFlipAtr<=1.0));
+      bool _shiftsOK=(_shiftsNow>=InpMinTermShifts) || _fast;
+      bool _cycleOK = (cur_entryReady=="Entry Active")
+                   || (_atFlipNow && _shiftsOK)
+                   || (cur_mtfEntryFresh && cur_mtfEntryDom>=InpMinDomTransfer && _shiftsOK)
+                   || _fast;
+      bool _ownerOK = (!InpOwnerMustAgree || cur_ownerDir==0 || dir==cur_ownerDir);
+      if(!_cycleOK){ gEntryBlock="building, not entry-cycle ("+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+", "+cur_compRegime+" comp)"; return; }
+      if(!_ownerOK){ gEntryBlock=(dir==1?"long":"short")+" vs owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":"bear"); return; }
+   }
    if(!aggressive){
       if(!PassesFilters(dir)) return;          // strict Letra path keeps full filters
    } else {
@@ -3655,40 +3713,15 @@ void TryEnter()
    double ask=sym.Ask(), bid=sym.Bid();
    double entry=(dir==1?ask:bid);
    gRecSizeMult=RecSizeMult();          // recursion-size-aware stop sizing (compression -> loop size)
-   double slBase;
-   if(fuEntry && !naf(ctx_fuTip)){
-      double a=cur_atr; if(a<=0) a=10*_Point;
-      slBase=(dir==1? ctx_fuTip - InpMinSLAtr*gRecSizeMult*a : ctx_fuTip + InpMinSLAtr*gRecSizeMult*a);   // stop BEYOND the FU wick extreme
-      //--- and push it beyond the recent key swing high/low (whichever protects more) ---
-      double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){
-         if(dir==1)  slBase=MathMin(slBase,ks);
-         else        slBase=MathMax(slBase,ks);
-      }
-      double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
-      if(dir==1 && slBase>entry-minD) slBase=entry-minD;
-      if(dir==-1&& slBase<entry+minD) slBase=entry+minD;
-      double maxD=InpMaxSLAtr*a;                                                // safety cap
-      if(dir==1 && slBase<entry-maxD) slBase=entry-maxD;
-      if(dir==-1&& slBase>entry+maxD) slBase=entry+maxD;
-      slBase=NormPrice(slBase);
-   } else slBase=ComputeSL(dir,entry);
-   //--- multi-TF entry: anchor the stop beyond THAT rung's invalidation (+ key swing) ---
-   if(mtfEntry && !naf(cur_mtfEntryInv)){
-      double a=cur_atr; if(a<=0) a=10*_Point;
-      double s2=cur_mtfEntryInv + (dir==1? -InpSLEngineBufATR*a : InpSLEngineBufATR*a);
-      double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){ if(dir==1) s2=MathMin(s2,ks); else s2=MathMax(s2,ks); }
-      double minD=MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
-      if(dir==1 && s2>entry-minD) s2=entry-minD;
-      if(dir==-1&& s2<entry+minD) s2=entry+minD;
-      double maxD=InpMaxSLAtr*a;
-      if(dir==1 && s2<entry-maxD) s2=entry-maxD;
-      if(dir==-1&& s2>entry+maxD) s2=entry+maxD;
-      slBase=NormPrice(s2);
-   }
+   double slBase=ComputeStructureSL(dir,entry,fuEntry,mtfEntry);   // F72: stop BEYOND the actual structure price is reacting off
    double lot=CalcLot(entry,slBase);
    double tp=ComputeTP(dir,entry,slBase);
+   //--- F72 RR FLOOR: a terminal entry must have room for at least InpMinEntryRR (kills the RR<1 bleed) ---
+   if(InpMinEntryRR>0.0){
+      double _riskF=MathAbs(entry-slBase);
+      double _rrF=_riskF>0?MathAbs(tp-entry)/_riskF:0.0;
+      if(_rrF<InpMinEntryRR){ gEntryBlock="RR "+DoubleToString(_rrF,2)+" < min "+DoubleToString(InpMinEntryRR,2)+" (no room)"; return; }
+   }
    bool _arrow=(dir==1?cur_longSignal:cur_shortSignal);
    bool _doe=(dir==1?(cur_doeAction=="Long"):(cur_doeAction=="Short"));
    string _trig=fuEntry?"FU":mtfEntry?("MTF:"+cur_mtfEntryTF):aggressive?"V60AGG":(_arrow&&_doe)?"ARROW+DOE":_arrow?"ARROW":"DOE";
@@ -3697,7 +3730,7 @@ void TryEnter()
    bool ok=false;
    if(InpUseLimitEntry && !naf(cur_doeEntryMid)){
       double lim=NormPrice(cur_doeEntryMid);
-      double slL=ComputeSL(dir,lim);
+      double slL=ComputeStructureSL(dir,lim,fuEntry,mtfEntry);
       double tpL=ComputeTP(dir,lim,slL);
       double lotL=CalcLot(lim,slL);
       datetime exp=(InpPendingExpiryBars>0)?(TimeCurrent()+(datetime)(InpPendingExpiryBars*PeriodSeconds(_Period))):0;
