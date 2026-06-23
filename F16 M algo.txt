@@ -102,7 +102,7 @@ input bool ecvLows           = true;
 input bool ecvExpansion      = true;
 input bool ecvPreConvexity   = true;
 input bool ecvConvexity      = true;
-input bool ecvAbsorption     = true;
+input bool ecvAbsorption     = true;   // SPEC: renamed conceptually to "Transition Environment" (recursive depth/CHOCH/compression/failure/dominance)
 input bool ecvRetracement    = true;
 input bool ecvInduction      = true;
 input bool ecvLiquidation    = true;
@@ -565,7 +565,9 @@ void ComputeSE(const ENUM_TIMEFRAMES tfReq, const int bars,
          if(phaseState==12 && ((dir==1&&bullCH)||(dir==-1&&bearCH))) phaseState=13;
       }
       //--- map v60 code -> Letra canonical code so Letra's combiner is unchanged ---
-      //  v60: 7 Transition->Absorption, 9 HTF Flip->Retr Pre-Cvx, 10 Induction->Retr Induction,
+      //  v60: 7 Transition Environment (was "Absorption" — SPEC: not a phase but a recursive
+      //  environment containing internal CHOCHs, compression, failure swings, dominance transfer),
+      //  9 HTF Flip->Retr Pre-Cvx, 10 Induction->Retr Induction,
       //       11 Liquidation/12 Terminal->Retr Liquidity, 13/14 Return->Demand/Supply Return.
       int v60c=phaseState;
       if(v60c==5 && dir==-1) v60c=6;
@@ -816,7 +818,7 @@ string f_phaseStr(const int c)
       case 4:  return("Expansion Liquidity");
       case 5:  return("New High");
       case 6:  return("New Low");
-      case 7:  return("Absorption");
+      case 7:  return("Transition Environment");
       case 8:  return("Retracement");
       case 9:  return("Retracement Pre-Convexity");
       case 10: return("Retracement Induction");
@@ -834,7 +836,7 @@ string f_hypFam(const string ph)
    if(ph=="Expansion Liquidity")       return("CONVEXITY FORMING");
    if(ph=="New High")                  return("CREATION FORMING");
    if(ph=="New Low")                   return("CREATION FORMING");
-   if(ph=="Absorption")                return("ABSORPTION");
+   if(ph=="Transition Environment")    return("TRANSITION ENVIRONMENT");
    if(ph=="Demand Return")             return("DEMAND/SUPPLY RETURN");
    if(ph=="Supply Return")             return("DEMAND/SUPPLY RETURN");
    return("RETRACEMENT");
@@ -843,15 +845,15 @@ string f_famSimple(const int f)
 {
    if(f==1) return("Expansion");
    if(f==2) return("Pre-Convexity");
-   if(f==4) return("Absorption");
+   if(f==4) return("Transition Environment");
    if(f==5) return("Liquidity");
-   if(f==6) return("Absorption");
+   if(f==6) return("Transition Environment");
    return("Expansion");
 }
 string f_famMicro(const int f)
 {
    if(f==2) return("M1 Convexity");
-   if(f==4) return("M1 Absorption");
+   if(f==4) return("M1 Transition Environment");
    if(f==5) return("M1 Liquidity");
    return("M1 Expansion");
 }
@@ -1588,7 +1590,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    string expectedNextPhase=
         (predScore_DemandReturn>=predScore_Retracement&&predScore_DemandReturn>=predScore_Absorption&&predScore_DemandReturn>=predScore_Creation&&predScore_DemandReturn>=predScore_Convexity&&predScore_DemandReturn>=predScore_Expansion)?(direction==-1?"Supply Return":"Demand Return"):
         (predScore_Retracement>=predScore_Absorption&&predScore_Retracement>=predScore_Creation&&predScore_Retracement>=predScore_Convexity&&predScore_Retracement>=predScore_Expansion)?"Retracement":
-        (predScore_Absorption>=predScore_Creation&&predScore_Absorption>=predScore_Convexity&&predScore_Absorption>=predScore_Expansion)?"Absorption":
+        (predScore_Absorption>=predScore_Creation&&predScore_Absorption>=predScore_Convexity&&predScore_Absorption>=predScore_Expansion)?"Transition Environment":
         (predScore_Creation>=predScore_Convexity&&predScore_Creation>=predScore_Expansion)?(direction==-1?"New Low":"New High"):
         (predScore_Convexity>=predScore_Expansion)?"Expansion Pre-Convexity":"Expansion";
    double expectedNextProb=_maxPredScore>0?fmin2(_maxPredScore/fmax2(_maxPredScore+30.0,1.0)*100.0,95.0):50.0;
@@ -1816,7 +1818,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    //==============================================================
    // SECTION 24 — TRADE STATE
    //==============================================================
-   bool exitCondition=(g_tradeDir==1&&bearBOS)||(g_tradeDir==-1&&bullBOS)||(g_tradeDir==1&&bearConvShift&&energy<g_prevEnergy)||(g_tradeDir==-1&&bullConvShift&&energy<g_prevEnergy)||(g_tradeDir==1&&htfAlign==-1)||(g_tradeDir==-1&&htfAlign==1)||(g_tradeDir!=0&&!obFresh)||(g_tradeDir!=0&&safeToReset)||(g_tradeDir==1&&bullInvalid)||(g_tradeDir==-1&&bearInvalid)||(g_tradeDir!=0&&(ie1a_currentPhase=="Absorption"||ie1a_currentPhase=="Retracement"));
+   bool exitCondition=(g_tradeDir==1&&bearBOS)||(g_tradeDir==-1&&bullBOS)||(g_tradeDir==1&&bearConvShift&&energy<g_prevEnergy)||(g_tradeDir==-1&&bullConvShift&&energy<g_prevEnergy)||(g_tradeDir==1&&htfAlign==-1)||(g_tradeDir==-1&&htfAlign==1)||(g_tradeDir!=0&&!obFresh)||(g_tradeDir!=0&&safeToReset)||(g_tradeDir==1&&bullInvalid)||(g_tradeDir==-1&&bearInvalid)||(g_tradeDir!=0&&(ie1a_currentPhase=="Transition Environment"||ie1a_currentPhase=="Retracement"));
    if(longSignal){ g_tradeDir=1; g_exitFiredBar=-1; }
    else if(shortSignal){ g_tradeDir=-1; g_exitFiredBar=-1; }
    else if(exitCondition&&g_tradeDir!=0){ g_exitFiredBar=i; g_tradeDir=0; }
@@ -1949,8 +1951,8 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    double l3_dominance=fmin2(nz(se3_mf)*0.60+nz(se3_wp)*0.40,100.0);
    string dominantWaveLevel=(l2_dominance>=l1_dominance&&l2_dominance>=l0_dominance&&l2_dominance>=l3_dominance)?"L2 HTF":(l1_dominance>=l0_dominance&&l1_dominance>=l3_dominance)?"L1 CHILD":(l0_dominance>=l3_dominance)?"L0 PRIMARY":"L3 MICRO";
    bool htfTrendIntact=l2_dominantPhase=="Expansion"&&g_l2_confidence>45.0;
-   bool ltfReversalForming=((fam_l0==4||fam_l0==5)||(l3_dominantPhase=="M1 Absorption"||l3_dominantPhase=="M1 Liquidity"))&&!(g_liqg_active&&!(liqg_objArrival&&liqg_trueCHoCH));
-   string fusionInterpretation=(htfTrendIntact&&!ltfReversalForming)?"HTF Intact - LTF Expansion Aligned":(htfTrendIntact&&ltfReversalForming)?"HTF Intact - LTF Reversal Forming":(!htfTrendIntact&&ltfReversalForming)?"HTF Weakening - LTF Reversal Confirming":(l2_dominantPhase=="Absorption"&&l1_dominantPhase=="Expansion")?"HTF Absorption - ITF Counter-Bounce":(l2_dominantPhase=="Liquidity"&&(l1_dominantPhase=="Absorption"||fam_l0==5))?"HTF Liq Sweep - Entry Zone Forming":"Mixed - Await Alignment";
+   bool ltfReversalForming=((fam_l0==4||fam_l0==5)||(l3_dominantPhase=="M1 Transition Environment"||l3_dominantPhase=="M1 Liquidity"))&&!(g_liqg_active&&!(liqg_objArrival&&liqg_trueCHoCH));
+   string fusionInterpretation=(htfTrendIntact&&!ltfReversalForming)?"HTF Intact - LTF Expansion Aligned":(htfTrendIntact&&ltfReversalForming)?"HTF Intact - LTF Reversal Forming":(!htfTrendIntact&&ltfReversalForming)?"HTF Weakening - LTF Reversal Confirming":(l2_dominantPhase=="Transition Environment"&&l1_dominantPhase=="Expansion")?"HTF Transition - ITF Counter-Bounce":(l2_dominantPhase=="Liquidity"&&(l1_dominantPhase=="Transition Environment"||fam_l0==5))?"HTF Liq Sweep - Entry Zone Forming":"Mixed - Await Alignment";
    double fusionConfidence=fmin2(g_l2_confidence*0.40+g_l1_confidence*0.30+l0_confidence*0.20+l3_confidence*0.10,100.0);
    double _cycleBaseProg=nz(waveProgress,0.0);
    double cycle1_completion=fmin2((g_entryCycle>=1?60.0:_cycleBaseProg*0.60)+(recursiveComplete&&g_entryCycle>=1?40.0:0.0),100.0);
@@ -1959,7 +1961,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    double cycle4_completion=fmin2((g_entryCycle>=4?60.0:g_entryCycle>=3?_cycleBaseProg*0.40:0.0)+(recursiveComplete&&g_entryCycle>=4?40.0:0.0),100.0);
    string activeCyclePhase=g_entryCycle==0?("Cycle 1 - "+l0_phaseCanon):("Entry Cycle "+IntegerToString(g_entryCycle)+" - "+l0_phaseCanon);
    double geoCapacityScore=fmin2((geoFullConvexityPossible?100.0:geoPartialConvexityPossible?60.0:25.0)*(!naf(flipzoneWidth)?fmax2(0.5,1.0-flipzoneWidth/fmax2(atr*4.0,1e-10)):0.5),100.0);
-   string geoCapacityNarrative=geoFullConvexityPossible?"Full Conv - Complete wave expression":geoPartialConvexityPossible?"Partial Conv - Limited but tradeable":"Absorption Only - Expect rapid absorption";
+   string geoCapacityNarrative=geoFullConvexityPossible?"Full Conv - Complete wave expression":geoPartialConvexityPossible?"Partial Conv - Limited but tradeable":"Transition Only - Expect rapid transition";
 
 
    //==============================================================
@@ -2070,7 +2072,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    bool _nePhaseExpBull=ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High";
    bool _nePhaseExpBear=ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New Low";
    bool _nePullback=ie1a_currentPhase=="Retracement"||ie1a_currentPhase=="Retracement Pre-Convexity"||ie1a_currentPhase=="Retracement Induction"||ie1a_currentPhase=="Retracement Liquidity";
-   string ne_dominantNarrative=displayWaveDir_M5==0?"No Clear Narrative":(displayWaveDir_M5==1&&_nePhaseExpBull&&rot_transferProbability<40)?"Bullish Continuation":(displayWaveDir_M5==-1&&_nePhaseExpBear&&rot_transferProbability<40)?"Bearish Continuation":(displayWaveDir_M5==1&&(_nePullback||ie1a_currentPhase=="Demand Return"))?"Bullish Pullback":(displayWaveDir_M5==-1&&(_nePullback||ie1a_currentPhase=="Supply Return"))?"Bearish Pullback":(displayWaveDir_M5==1&&(rot_transferProbability>=55||ie1a_currentPhase=="Absorption"))?"Bullish Reversal Developing":(displayWaveDir_M5==-1&&(rot_transferProbability>=55||ie1a_currentPhase=="Absorption"))?"Bearish Reversal Developing":(displayWaveDir_M5==1?"Bullish Developing":displayWaveDir_M5==-1?"Bearish Developing":"No Clear Narrative");
+   string ne_dominantNarrative=displayWaveDir_M5==0?"No Clear Narrative":(displayWaveDir_M5==1&&_nePhaseExpBull&&rot_transferProbability<40)?"Bullish Continuation":(displayWaveDir_M5==-1&&_nePhaseExpBear&&rot_transferProbability<40)?"Bearish Continuation":(displayWaveDir_M5==1&&(_nePullback||ie1a_currentPhase=="Demand Return"))?"Bullish Pullback":(displayWaveDir_M5==-1&&(_nePullback||ie1a_currentPhase=="Supply Return"))?"Bearish Pullback":(displayWaveDir_M5==1&&(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment"))?"Bullish Reversal Developing":(displayWaveDir_M5==-1&&(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment"))?"Bearish Reversal Developing":(displayWaveDir_M5==1?"Bullish Developing":displayWaveDir_M5==-1?"Bearish Developing":"No Clear Narrative");
    double ne_narrativeStrength=fmin2(mce_alignmentScore*0.40+rot_controlStability*0.30+(re_resolutionState=="RESOLVED"?30.0:re_resolutionState=="PARTIALLY RESOLVED"?15.0:0.0),100.0);
    //--- V72.5 INV ---
    double inv_bullOriginPrice=!naf(point4OriginLow)?point4OriginLow-atr*in_invOriginBuffer:NA;
@@ -2111,7 +2113,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    string doe_entryTrigger=frz_inProximity?"Limit":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?"LimitOnRetest":"Market";
    //--- V72.8b OPPORTUNITY ---
    double _opStruct=displayWaveDir_M5==0?0.0:(direction==displayWaveDir_M5?100.0:70.0);
-   double _opLifecycle=(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?100.0:(ie1a_currentPhase=="Absorption"||_nePullback)?70.0:(ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?55.0:(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="Expansion Pre-Convexity"||ie1a_currentPhase=="Expansion Induction"||ie1a_currentPhase=="Expansion Liquidity")?45.0:ie1a_currentPhase=="Point 4 Origin"?25.0:0.0;
+   double _opLifecycle=(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?100.0:(ie1a_currentPhase=="Transition Environment"||_nePullback)?70.0:(ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?55.0:(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="Expansion Pre-Convexity"||ie1a_currentPhase=="Expansion Induction"||ie1a_currentPhase=="Expansion Liquidity")?45.0:ie1a_currentPhase=="Point 4 Origin"?25.0:0.0;
    double _opReturn=naf(frz_distanceToZone)?(frz_inProximity?100.0:0.0):fmax2(0.0,100.0-frz_distanceToZone*40.0);
    double _opDisplace=fmax2(re_recursiveCompletionScore,ede_dissipationProgress);
    double _opConfluence=(frz_attractorConvergence?50.0:0.0)+((frz_inProximity&&frz_bestZoneDir==displayWaveDir_M5)?50.0:0.0);
@@ -2121,7 +2123,7 @@ void ProcessBar(const int i,const double &o[],const double &h[],const double &l[
    bool _opInZone=frz_inProximity&&frz_bestZoneDir==displayWaveDir_M5;
    string oppState=oppVeto?"STAND DOWN":(oppProgress>=95&&_opInZone)?"TRADE ACTIVE":oppProgress>=85?"PREPARE TO EXECUTE":oppProgress>=60?"OPPORTUNITY CONFIRMING":oppProgress>=20?"OPPORTUNITY FORMING":"STAND DOWN";
    string _cmdDirWord=displayWaveDir_M5==1?"Bullish":displayWaveDir_M5==-1?"Bearish":"Neutral";
-   string cmd_narrative=displayWaveDir_M5==0?"No directional thesis":inv_invalidated?_cmdDirWord+" thesis invalidated":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?_cmdDirWord+" return-to-zone - execution window":(rot_transferProbability>=55||ie1a_currentPhase=="Absorption")?_cmdDirWord+" reversal developing":(_nePullback||ie1a_currentPhase=="Retracement")?_cmdDirWord+" pullback in progress":(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?_cmdDirWord+" continuation":_cmdDirWord+" developing";
+   string cmd_narrative=displayWaveDir_M5==0?"No directional thesis":inv_invalidated?_cmdDirWord+" thesis invalidated":(ie1a_currentPhase=="Demand Return"||ie1a_currentPhase=="Supply Return")?_cmdDirWord+" return-to-zone - execution window":(rot_transferProbability>=55||ie1a_currentPhase=="Transition Environment")?_cmdDirWord+" reversal developing":(_nePullback||ie1a_currentPhase=="Retracement")?_cmdDirWord+" pullback in progress":(ie1a_currentPhase=="Expansion"||ie1a_currentPhase=="New High"||ie1a_currentPhase=="New Low")?_cmdDirWord+" continuation":_cmdDirWord+" developing";
    //--- registries ---
    V72Registries(i,direction,ie1a_currentPhase,re_recursiveCompletionScore,ede_expansionEnergy,ede_state,ede_liquidationBecomingDirectional,re_resolutionState);
    //--- traceability ---
