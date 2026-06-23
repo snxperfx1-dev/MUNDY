@@ -3128,20 +3128,20 @@ input double        InpTPrr             = 2.0;          // TP = RR * risk (TP_RR
 input double        InpTPAtrMult        = 3.0;          // TP = ATR * mult (TP_ATR)
 input bool          InpUsePartial       = true;         // Partial close at first target
 input double        InpPartialPct       = 50.0;         // Partial close % at TP1
-input bool          InpMoveBEAfterTP1   = true;         // Move SL to BE after partial (lock the rest risk-free once TP1 banks)
+input bool          InpMoveBEAfterTP1   = false;        // Move SL to BE after partial (OFF - let the runner breathe to target)
 
 input group "Letra37 EA - Trade Management"
-input bool          InpUseBreakeven     = true;         // Enable break-even
+input bool          InpUseBreakeven     = false;        // Enable break-even (OFF - was scratching winners; let the trade work)
 input double        InpBETriggerRR      = 1.0;          // BE trigger in RR (earlier: winners were giving back before 3R)
 input double        InpBETriggerPoints  = 300;         // BE trigger in ticks/points (whichever hits first)
 input int           InpBEOffsetPoints   = 20;          // BE offset (points, locked profit)
-input bool          InpUseTrailing      = true;         // Enable trailing stop
+input bool          InpUseTrailing      = false;        // Enable trailing stop (OFF - trailing was cutting runners short)
 input ENUM_TRAIL_MODE InpTrailMode      = TRAIL_ATR;    // Trailing mode
 input double        InpTrailAtrMult     = 2.0;          // Trail distance = ATR * mult
 input int           InpTrailPoints      = 200;          // Trail distance (points)
 input int           InpTrailStepPoints  = 20;           // Min step to move trail (points)
-input bool          InpExitOnOpposite   = true;         // Close on opposite engine signal
-input bool          InpExitOnInvalid    = true;         // Close on engine invalidation
+input bool          InpExitOnOpposite   = false;        // Close on opposite engine signal (OFF - let the trade run to SL/TP)
+input bool          InpExitOnInvalid    = false;        // Close on engine invalidation (OFF - the structure SL is the only stop)
 input bool          InpExitOnPhaseFlip  = false;        // Close on Absorption/Retracement phase (off - was cutting too early)
 input int           InpMinHoldBars      = 5;            // Min bars to hold before ANY discretionary exit (SL/TP always active)
 input bool          InpHoldWithThesis   = true;         // HOLD a bias-aligned trade through opposite signals while the thesis still supports it
@@ -3568,21 +3568,28 @@ double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,co
 {
    double a=cur_atr; if(a<=0) a=10*_Point;
    double buf=InpKeyLevelBufATR*a*gRecSizeMult;
-   double lvl=NA;
+   //--- 1) PRIMARY structure = the recent swing high/low price is actually reacting off.
+   //       KeyLevelStop returns a buffered stop on the PROTECTIVE side only (0 = none),
+   //       so it can never land on the wrong side of entry. ---
+   double sl=0.0; bool haveLvl=false;
    if(InpStructureStop){
-      if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) lvl=ctx_lowestFlip;     // the true S/D the curve plays off
-      else if(mtfEntry && !naf(cur_mtfEntryInv))                          lvl=cur_mtfEntryInv;     // the owning rung's invalidation
-      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))             lvl=ctx_fuTip;           // beyond the FU wick extreme
-      else if(!naf(cur_invActiveStop))                                    lvl=cur_invActiveStop;   // engine structural invalidation
-   }
-   double sl; bool haveLvl=!naf(lvl);
-   if(haveLvl) sl=lvl + (dir==1? -buf : buf);                              // stop sits JUST beyond the actual structure level
-   else        sl=ComputeSL(dir,entry);                                    // no structure -> engine/ATR/key-swing fallback
-   //--- only when there is NO real structure do we widen out to the recent key swing ---
-   if(!haveLvl){
       double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){ if(dir==1) sl=MathMin(sl,ks); else sl=MathMax(sl,ks); }
+      if(ks!=0.0){ sl=ks; haveLvl=true; }
+      //--- 2) refine with the entry's OWN structural level (rung invalidation / FU tip /
+      //       true-induction flip) ONLY if it sits on the protective side; take whichever
+      //       protects more, so the stop is beyond the level the entry keys off but NEVER on
+      //       the wrong side (this was the bug that jammed reversal stops to min-distance). ---
+      double L=NA;
+      if(mtfEntry && !naf(cur_mtfEntryInv))                                    L=cur_mtfEntryInv;
+      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))                  L=ctx_fuTip;
+      else if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) L=ctx_lowestFlip;
+      if(!naf(L)){
+         double sL=L + (dir==1? -buf : buf);
+         if(dir==1 && sL<entry){ sl=(haveLvl?MathMin(sl,sL):sL); haveLvl=true; }
+         if(dir==-1&& sL>entry){ sl=(haveLvl?MathMax(sl,sL):sL); haveLvl=true; }
+      }
    }
+   if(!haveLvl) sl=ComputeSL(dir,entry);                                       // no structure -> engine/ATR fallback
    //--- min distance: ON STRUCTURE = broker-min + wick buffer only (stays tight to the level);
    //--- OFF STRUCTURE = the wider ATR floor so a fallback stop is not razor-thin. ---
    double minD = haveLvl ? (MinStopDist()+buf) : MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
