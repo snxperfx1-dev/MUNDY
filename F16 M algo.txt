@@ -2760,6 +2760,11 @@ bool   ctx_inManipBand=false;     // price is in the 0.618-0.786 fib band (manip
 double ctx_lowestFlip=NA;         // the lowest active on-bias flip = true S/D
 bool   ctx_atTrueInduction=false; // price is at the lowest flip (true induction zone = prime entry)
 bool   ctx_failureSwing=false;    // sweep beyond the true flip then reclaim in compression = spring (fast entry)
+//--- ARC v2 (SYMPHONY port): convex curved target trajectory ---
+double ctx_arcApex=NA;            // the projected convex APEX (curve target) for the current wave
+double ctx_arcNow=NA;             // time-projected expected price along the arc (wave-progress t)
+int    ctx_arcDir=0;              // direction the arc projects (+1 up / -1 down)
+double ctx_cExtreme=NA;           // raw current leg extreme (published by ContextRun, consumed by ComputeARC)
 //--- persistent terminal-counter state (updated once per bar) ---
 bool   g_termActive=false; int g_termShifts=0; int g_termPrevDirM5=0;
 //--- TIE detail ---
@@ -3068,6 +3073,9 @@ void ContextRun(const int bars)
    ctx_life=life; ctx_cpForce=cpForce; ctx_cpState=cpState; ctx_alive=aliveTx; ctx_h1Timing=h1Timing; ctx_wp=c_wp; ctx_atr=atrL;
    ctx_narrative=narrative; ctx_narrState=narrState; ctx_converging=converging; ctx_chainVitality=chainVitality;
    ctx_mig50=mig50; ctx_mig618=mig618; ctx_retrX=retrX;
+   //--- ARC v2 (SYMPHONY port): publish the raw leg extreme only; the convex apex is built in
+   //  ComputeARC() (EA section) so it can use the ARC inputs declared there (declare-before-use). ---
+   ctx_cExtreme=cExtreme;
 }
 
 
@@ -3206,6 +3214,17 @@ input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme c
 input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
+input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion / Risk)"
+input double InpAnchorBufATR      = 0.25;  // STOP buffer beyond the curve-origin / invalidation level (xATR) - SYMPHONY-tight
+input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
+input double InpArcExtMult        = 1.5;   // ARC extension: apex = leg origin + leg*this (the projected curve apex)
+input double InpArcConvPower      = 1.5;   // ARC convexity power (time-curvature of the projected path)
+input bool   InpUseExhaustionExit = true;  // Composite EXIT: close on ARC-apex + wave/phase collapse + sweep-reclaim (terminal exhaustion)
+input double InpArcTolATR         = 0.20;  // How close to the ARC apex counts as "reached" (xATR)
+input bool   InpUseRiskThrottle   = true;  // DRDWCT-lite: vol-scaled risk + risk-density lot cap + block-new on open-risk breach
+input double InpRDLimit           = 0.01;  // Risk-density cap: max lots per 1.0 price-unit of stop distance (tiny-stop -> oversized-lot guard)
+input double InpMaxOpenRiskPct    = 6.0;   // Block NEW entries when open positions' risk-to-SL exceeds this % of equity
+
 //==================================================================
 // EA GLOBALS
 //==================================================================
@@ -3275,12 +3294,60 @@ double MoneyPerPointPerLot()
 double CalcLot(const double entry,const double sl)
 {
    if(InpLotMode==LOT_FIXED) return(NormalizeLot(InpFixedLot));
-   double riskMoney=gAccount.Equity()*InpRiskPercent/100.0;
+   double riskPct=InpRiskPercent;
+   //--- vol-regime scale (DRDWCT-style): when current ATR is elevated vs its 20-bar mean, cut
+   //  risk - the market is wilder so size down. ---
+   if(InpUseRiskThrottle && cur_volRatio>1.0)
+      riskPct *= clamp(1.0/cur_volRatio, 0.5, 1.0);
+   double riskMoney=gAccount.Equity()*riskPct/100.0;
    double slPts=MathAbs(entry-sl)/_Point;
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
    double lot=riskMoney/(slPts*mpp);
+   //--- RD "micro-bomb" cap (DRDWCT): risk density = lots / stop-distance(price). A very tight
+   //  stop must NOT create an oversized lot. Cap lots so RD <= InpRDLimit. ---
+   if(InpUseRiskThrottle && InpRDLimit>0.0){
+      double distPx=MathAbs(entry-sl);
+      if(distPx>0.0){ double rdCap=InpRDLimit*distPx; if(lot>rdCap) lot=rdCap; }
+   }
    return(NormalizeLot(lot));
+}
+
+//--- DRDWCT-lite: total open risk-to-SL of own positions as a % of equity (book heat) ---
+double OpenRiskFrac()
+{
+   double eq=gAccount.Equity(); if(eq<=0) return(0.0);
+   double mpp=MoneyPerPointPerLot(); if(mpp<=0) return(0.0);
+   double tot=0.0;
+   for(int q=PositionsTotal()-1;q>=0;q--){
+      ulong tk=PositionGetTicket(q); if(tk==0) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      double op =PositionGetDouble(POSITION_PRICE_OPEN);
+      double psl=PositionGetDouble(POSITION_SL);
+      double vol=PositionGetDouble(POSITION_VOLUME);
+      if(psl<=0.0) continue;
+      tot += (MathAbs(op-psl)/_Point)*mpp*vol;
+   }
+   return(tot/eq*100.0);
+}
+
+//--- ARC v2 apex builder (SYMPHONY port): uses the ARC inputs (declared in the EA section) and
+//  the raw leg values published by ContextRun. apex = leg origin + dir*leg*ExtMult (the convex
+//  curve target); ctx_arcNow is the time-projected expected price along the arc. ---
+void ComputeARC()
+{
+   ctx_arcApex=NA; ctx_arcNow=NA; ctx_arcDir=0;
+   int    wd =ctx_waveDir;
+   double org=ctx_stop;        // leg origin = invalidation / protective extreme
+   double ext=ctx_cExtreme;    // current leg extreme
+   if(wd==0 || naf(org) || naf(ext)) return;
+   double imp=MathAbs(ext-org);
+   if(imp<=0.0) return;
+   double apex=org + (double)wd*imp*InpArcExtMult;
+   double t   =clamp(ctx_wp/100.0,0.0,1.0);
+   ctx_arcApex=apex;
+   ctx_arcNow =org + (apex-org)*MathPow(t,InpArcConvPower);
+   ctx_arcDir =wd;
 }
 
 //--- management memory ---
@@ -3420,6 +3487,7 @@ void ComputeEngine()
    ResetState();
    EngineRun(got,eaT,eaO,eaH,eaL,eaC,eaVol,MathMax(warmup,got-InpEngineBars));
    if(InpUseV60Context) ContextRun(InpEngineBars);   // v60 context (does not alter Letra cur_* decision)
+   ComputeARC();                                      // SYMPHONY ARC apex/value from the published leg
 }
 
 //==================================================================
@@ -3560,41 +3628,35 @@ double ComputeSL(const int dir,const double entry)
    return(NormPrice(sl));
 }
 
-//--- F72: place the stop JUST beyond the actual STRUCTURE price is reacting off — tight to
-//  the level, not widened out. priority: true-induction lowest flip (the real S/D) -> the
-//  owning rung's invalidation -> the FU wick tip -> the engine's structural invalidation.
-//  Only when NO structure is found do we fall back to the ATR/key-swing stop. ATR cap always.
+//--- SYMPHONY-style STOP: the stop sits JUST beyond the ONE level whose break invalidates the
+//  trade = the curve's origin / anchor. We pick a SINGLE coherent level by priority (the level
+//  the entry keys off), side-validate it (so a wrong-side level can never be used - the old
+//  reversal bug), buffer it by a small ATR amount, and set it once. The recent swing is only a
+//  fallback when no origin level exists. ATR safety cap always applies.
 double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,const bool mtfEntry)
 {
    double a=cur_atr; if(a<=0) a=10*_Point;
-   double buf=InpKeyLevelBufATR*a*gRecSizeMult;
-   //--- 1) PRIMARY structure = the recent swing high/low price is actually reacting off.
-   //       KeyLevelStop returns a buffered stop on the PROTECTIVE side only (0 = none),
-   //       so it can never land on the wrong side of entry. ---
-   double sl=0.0; bool haveLvl=false;
+   double buf=InpAnchorBufATR*a*gRecSizeMult;
+   double lvl=NA;
    if(InpStructureStop){
-      double ks=KeyLevelStop(dir,entry);
-      if(ks!=0.0){ sl=ks; haveLvl=true; }
-      //--- 2) refine with the entry's OWN structural level (rung invalidation / FU tip /
-      //       true-induction flip) ONLY if it sits on the protective side; take whichever
-      //       protects more, so the stop is beyond the level the entry keys off but NEVER on
-      //       the wrong side (this was the bug that jammed reversal stops to min-distance). ---
-      double L=NA;
-      if(mtfEntry && !naf(cur_mtfEntryInv))                                    L=cur_mtfEntryInv;
-      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))                  L=ctx_fuTip;
-      else if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) L=ctx_lowestFlip;
-      if(!naf(L)){
-         double sL=L + (dir==1? -buf : buf);
-         if(dir==1 && sL<entry){ sl=(haveLvl?MathMin(sl,sL):sL); haveLvl=true; }
-         if(dir==-1&& sL>entry){ sl=(haveLvl?MathMax(sl,sL):sL); haveLvl=true; }
-      }
+      if(mtfEntry && !naf(cur_mtfEntryInv))                                    lvl=cur_mtfEntryInv;   // owning rung invalidation (leg origin)
+      else if(fuEntry && InpUseV60Context && !naf(ctx_fuTip))                  lvl=ctx_fuTip;         // FU wick extreme (curve origin)
+      else if(InpUseV60Context && ctx_atTrueInduction && !naf(ctx_lowestFlip)) lvl=ctx_lowestFlip;    // true S/D (lowest flip)
+      else if(!naf(cur_invActiveStop))                                         lvl=cur_invActiveStop; // engine structural invalidation
+      //--- side-validate: a level on the WRONG side of entry is discarded (never jam to min-dist) ---
+      if(!naf(lvl) && ((dir==1 && lvl>=entry) || (dir==-1 && lvl<=entry))) lvl=NA;
    }
-   if(!haveLvl) sl=ComputeSL(dir,entry);                                       // no structure -> engine/ATR fallback
-   //--- min distance: ON STRUCTURE = broker-min + wick buffer only (stays tight to the level);
-   //--- OFF STRUCTURE = the wider ATR floor so a fallback stop is not razor-thin. ---
-   double minD = haveLvl ? (MinStopDist()+buf) : MathMax(MinStopDist()+_Point, InpMinSLAtr*gRecSizeMult*a);
+   double sl;
+   if(!naf(lvl)) sl=lvl + (dir==1? -buf : buf);                                // stop JUST beyond the invalidation/origin
+   else {
+      double ks=KeyLevelStop(dir,entry);                                       // fallback: recent swing (side-safe), else engine/ATR
+      sl=(ks!=0.0)? ks : ComputeSL(dir,entry);
+   }
+   //--- minimum distance: broker-min + the small anchor buffer (stay tight to the level) ---
+   double minD=MathMax(MinStopDist()+_Point, buf);
    if(dir==1  && sl>entry-minD) sl=entry-minD;
    if(dir==-1 && sl<entry+minD) sl=entry+minD;
+   //--- ATR safety cap ---
    double maxD=InpMaxSLAtr*a;
    if(dir==1  && sl<entry-maxD) sl=entry-maxD;
    if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
@@ -3618,6 +3680,12 @@ double ComputeTP(const int dir,const double entry,const double sl)
       tp=entry+(dir==1? atr*InpTPAtrMult : -atr*InpTPAtrMult);
    } else {
       tp=entry+(dir==1? risk*InpTPrr : -risk*InpTPrr);
+   }
+   //--- ARC curved target (SYMPHONY port): the convex apex is the real curve target the move
+   //  is projected to reach; use it when it sits FURTHER than the mode target (improves RR by
+   //  letting winners run to the curve apex instead of a flat near attractor). ---
+   if(InpUseARCTarget && !naf(ctx_arcApex) && ctx_arcDir==dir){
+      if((dir==1 && ctx_arcApex>tp) || (dir==-1 && ctx_arcApex<tp)) tp=ctx_arcApex;
    }
    //--- validate side; fall back to RR if engine target is on the wrong side ---
    if((dir==1 && tp<=entry) || (dir==-1 && tp>=entry))
@@ -3714,6 +3782,12 @@ void TryEnter()
    if(gHalted){ gEntryBlock="halted (daily loss)"; return; }
    if(InpMaxTradesPerDay>0 && gTradesToday>=InpMaxTradesPerDay){ gEntryBlock="max trades/day"; return; }
    if(InpMaxSpreadPoints>0){ long sp=(long)SymbolInfoInteger(_Symbol,SYMBOL_SPREAD); if(sp>InpMaxSpreadPoints){ gEntryBlock="spread "+IntegerToString((int)sp); return; } }
+   //--- DRDWCT-lite risk throttle: block a NEW entry when the book's open risk-to-SL is already
+   //  over the equity budget (stops stacking risk on an already-hot book). ---
+   if(InpUseRiskThrottle && InpMaxOpenRiskPct>0.0){
+      double _openRisk=OpenRiskFrac();
+      if(_openRisk>=InpMaxOpenRiskPct){ gEntryBlock="risk throttle: open risk "+DoubleToString(_openRisk,1)+"% >= "+DoubleToString(InpMaxOpenRiskPct,1)+"%"; return; }
+   }
 
    int ownDir=OwnPositionDir();
    if(ownDir!=0 && ownDir!=dir){
@@ -3949,6 +4023,48 @@ void ManagePositions()
 }
 
 //==================================================================
+// SYMPHONY COMPOSITE EXHAUSTION EXIT
+//==================================================================
+//--- Close ONLY when the move has objectively run its course - three independent confirmations
+//  must agree: (1) price reached the convex ARC apex region, (2) the curve/phase collapsed
+//  (the dominant wave flipped against the trade), (3) a sweep+reclaim rejection printed at the
+//  extreme (liquidity grab). This is "exit at terminal exhaustion" - it lets winners run to the
+//  curve apex instead of cutting early, but still banks before giving it all back. ---
+void ManageExhaustionExit()
+{
+   if(!InpUseExhaustionExit) return;
+   if(gMktClosed) return;
+   if(CountOwnPositions()<=0) return;
+   double a=cur_atr; if(a<=0) a=10*_Point;
+   int nb=(int)ArraySize(eaC);
+   if(nb<3) return;
+   int idx=nb-2, prv=nb-3;                 // last CLOSED bar + the one before
+   double hi=eaH[idx], lo=eaL[idx], cl=eaC[idx];
+   double mid=(hi+lo)*0.5;
+   for(int q=PositionsTotal()-1;q>=0;q--)
+   {
+      ulong tk=PositionGetTicket(q); if(tk==0) continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
+      int dir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1);
+      //--- 1) ARC exhaustion: price reached the convex apex region ---
+      bool arcHit=false;
+      if(!naf(ctx_arcApex) && ctx_arcDir==dir)
+         arcHit=(dir==1)? (hi>=ctx_arcApex-InpArcTolATR*a) : (lo<=ctx_arcApex+InpArcTolATR*a);
+      //--- 2) phase / curve collapse: the dominant wave has flipped against the trade ---
+      bool phaseCollapse=(ctx_waveDir!=0 && ctx_waveDir!=dir);
+      //--- 3) sweep + reclaim rejection at the extreme (institutional liquidity grab) ---
+      bool sweepReclaim=(dir==1)? (hi>eaH[prv] && cl<mid) : (lo<eaL[prv] && cl>mid);
+      if(arcHit && phaseCollapse && sweepReclaim)
+      {
+         if(InpDebugExits) Print("=== EXHAUSTION EXIT ",(dir==1?"BUY":"SELL")," #",tk,
+                                  "  arc=",DoubleToString(ctx_arcApex,_Digits),
+                                  "  waveDir=",ctx_waveDir,"  sweep+reclaim @",DoubleToString(cl,_Digits));
+         if(!trade.PositionClose(tk) && MktClosed()) return;
+      }
+   }
+}
+
+//==================================================================
 // STATUS PANEL
 //==================================================================
 void ShowStatus()
@@ -3967,6 +4083,7 @@ void ShowStatus()
    s+="Curve  : own "+cur_curveOwner+" "+f_waveDirLabel(cur_ownerDir)+"  "+cur_transState+"  ["+cur_entryReady+"]\n";
    s+="Recur  : dom "+R0(cur_domTransfer)+"%  comp "+cur_compRegime+"  depth "+IntegerToString(cur_recDepth)+"/"+IntegerToString(cur_expRecDepth)+(cur_mtfEntryFresh?("  | RET "+cur_mtfEntryTF+" "+(cur_mtfEntryDir==1?"L":"S")+" dom "+R0(cur_mtfEntryDom)+"%"):"")+"\n";
    s+="Cap    : budget "+R0(cur_curveBudget)+"%  toFlip "+DoubleToString(cur_distFlipAtr,1)+"ATR  entryP "+R0(cur_entryProb)+"%\n";
+   s+="ARC    : apex "+PXs(ctx_arcApex)+"  now "+PXs(ctx_arcNow)+"  dir "+(ctx_arcDir==1?"up":ctx_arcDir==-1?"down":"-")+"  openRisk "+DoubleToString(OpenRiskFrac(),1)+"%\n";
    if(InpUseV60Context) s+="Camp   : "+ctx_campaign+"  toFlip "+DoubleToString(ctx_distFlipAtr,1)+"ATR"+(ctx_atFlip?("  shifts "+IntegerToString(ctx_termShifts)+"/"+IntegerToString(ctx_termExpected)+" m1 "+IntegerToString(ctx_termM1Cycles)+(ctx_termComplete?" DONE":"")):"")+(ctx_fuMerged?"  [FU merged->parent]":"")+"\n";
    if(InpUseV60Context) s+="Induc  : "+(ctx_failureSwing?"FAILURE SWING (spring) - ":"")+(ctx_atTrueInduction?"TRUE INDUCTION (lowest flip "+PXs(ctx_lowestFlip)+")":ctx_inManipBand?"MANIPULATION band 0.618-0.786 (wait)":"-")+"\n";
    s+="Narr   : "+cur_cmdNarrative;
@@ -3999,6 +4116,7 @@ void OnTick()
       gMktClosed=false;          // new bar -> market may have reopened; re-allow management/flip order actions
       ComputeEngine();          // full recompute -> sets cur_* for last closed bar
       if(g_lastProcessed>=0){
+         ManageExhaustionExit(); // SYMPHONY composite terminal-exhaustion exit (closed-bar)
          TryEnter();             // evaluate entry on the just-closed bar
          if(InpDebugBlocks && StringFind(gEntryBlock,"ENTERED")<0 && gEntryBlock!="-" && gEntryBlock!="no signal (awaiting Return)")
             Print("[no-entry] ",gEntryBlock,"   | owner ",cur_curveOwner," ",cur_transState," camp ",ctx_campaign," dom ",DoubleToString(cur_domTransfer,0),"%");
