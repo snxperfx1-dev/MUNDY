@@ -961,6 +961,7 @@ int    g_dwr_nextId=1,g_dwr_activeId=0;
 //--- last fully-processed chart bar index (for incremental state) ---
 int    g_lastProcessed=-1;
 datetime g_lastHTFbuild=0;
+double gStrikeATR=1.5;   // mirror of InpStrikeATR (input declared later; ContextRun runs earlier so it reads this global), set in OnInit
 
 
 //==================================================================
@@ -3035,8 +3036,8 @@ void ContextRun(const int bars)
    //  41 ATR) and the bias-locked one-sided detection that could only see one direction. ---
    double _distSup = (!naf(fezHi))? MathAbs(clL-fezHi) : NA;   // distance to supply above
    double _distDem = (!naf(fezLo))? MathAbs(clL-fezLo) : NA;   // distance to demand below
-   bool   _strikeSup = (!naf(_distSup) && atrL>0 && _distSup<=atrL*1.0);
-   bool   _strikeDem = (!naf(_distDem) && atrL>0 && _distDem<=atrL*1.0);
+   bool   _strikeSup = (!naf(_distSup) && atrL>0 && _distSup<=atrL*gStrikeATR);
+   bool   _strikeDem = (!naf(_distDem) && atrL>0 && _distDem<=atrL*gStrikeATR);
    double _nearDist = NA;
    if(!naf(_distSup) && !naf(_distDem)) _nearDist=fmin2(_distSup,_distDem);
    else if(!naf(_distSup))              _nearDist=_distSup;
@@ -3227,7 +3228,7 @@ input ulong         InpDeviation        = 20;           // Max slippage (points)
 input string        InpComment          = "Letra37";    // Order comment
 input bool          InpShowStatus       = true;         // Show status panel (Comment)
 input bool          InpDebugEntries     = true;         // Print full entry reasoning to the Experts log (why each trade was taken)
-input bool          InpDebugBlocks      = false;        // Also log why entries are BLOCKED (verbose - maps near-misses)
+input bool          InpDebugBlocks      = true;         // Log why entries are BLOCKED (verbose) - ON so 'no trades' is diagnosable: prints the gate + OWNS verdict + values each bar
 input bool          InpDebugExits       = true;         // Print why each trade was CLOSED / its stop moved (maps early-exit & stop problems)
 
 input group "Letra37 EA - Live Safety"
@@ -3285,6 +3286,11 @@ input group "Letra37 EA - F72 v6 Ownership Gate (who owns price)"
 input bool   InpUseOwnershipGate     = true;  // v6: gate entries on the symmetric Ownership Resolver (BUILDING vs ENTRY_CYCLE). The keystone fix - only act once the recursive transition has completed and the new wave owns price (works at tops AND bottoms)
 input bool   InpOwnGateBlockBuilding = true;  // Suppress entries while the owner curve is still BUILDING / first-strike (kills the range-top chop). A fast spring still bypasses
 input bool   InpOwnGateRangeStrict   = true;  // In RANGEBOUND destinations only take a TERMINAL entry-cycle at the extreme (no mid-range returns)
+//--- ENTRY-CYCLE thresholds (calibrate from the chart). first strike = recursion 0 -> wait;
+//    entry cycle = recursion has BEGUN + dominance shifting -> act (NOT 'wait for full completion'). ---
+input double InpEC_MinNewOwn         = 40.0;  // ENTRY_CYCLE: min new-wave ownership % (recursive wave gaining control). Lower = enters earlier / more trades
+input int    InpEC_MinRecDepth       = 1;     // ENTRY_CYCLE: min recursions (phase-2 CHoCHs) - >=1 means the transition has actually started (0 = raw first strike = wait)
+input double InpStrikeATR            = 1.5;   // S/D STRIKE proximity: price is 'at' a supply/demand node within this many ATR (wider = registers strikes sooner)
 
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
 input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
@@ -3491,6 +3497,7 @@ int OnInit()
 
    gDayStamp=0; gTradesToday=0;
    gLastBarTime=0;
+   gStrikeATR=(InpStrikeATR>0.0?InpStrikeATR:1.5);   // sync the S/D-strike proximity mirror used by ContextRun
 
    //--- LIVE: startup summary so the running configuration is visible in the Experts log ---
    bool _live=!MQLInfoInteger(MQL_TESTER);
@@ -3622,16 +3629,17 @@ void ResolveOwnership()
    else if(cur_recDepth==2 || r=="High")     cur_transClass="Moderate";
    else                                      cur_transClass="Simple";
 
-   //--- the keystone verdict: BUILDING (first strike) vs ENTRY CYCLE (transfer complete) ---
-   //  ENTRY CYCLE REQUIRES GENUINE OWNERSHIP TRANSFER. The recursive wave must actually own price.
-   //  The spring / terminal-complete "accelerators" can only FAST-TRACK a transfer that is already
-   //  underway - they must be corroborated by real dominance (>=) and >=1 recursion AND real
-   //  proximity. This stops the bug where a runaway terminal counter (done=Y, shifts 20/4) forced
-   //  ENTRY_CYCLE on a first strike that the engine itself rated new=9% / rec 0 / entryP 4%. ---
-   bool core     = (cur_newWaveOwn>=55.0 && cur_recDepth>=cur_recExpected);                 // genuine transfer complete
-   bool springOK = (spring  && cur_recDepth>=1 && cur_newWaveOwn>=40.0);                     // spring: transfer underway, fast
-   bool termOK   = (termDn  && atFlipReal && cur_recDepth>=1 && cur_newWaveOwn>=45.0);       // terminal seq: must be corroborated + actually at the objective
-   bool engOK    = (cur_entryReady=="Entry Active" && cur_newWaveOwn>=45.0);                 // engine's own read, still needs real transfer
+   //--- the keystone verdict: BUILDING (first strike) vs ENTRY CYCLE (transition has BEGUN) ---
+   //  Spec Example 1 vs 2: a RAW first strike (recursion 0) = BUILDING -> wait. Once the recursive
+   //  transition has actually STARTED (>=InpEC_MinRecDepth recursions) AND the recursive wave is
+   //  gaining control (>=InpEC_MinNewOwn %), the entry cycle is ACTIVE -> act. We do NOT wait for
+   //  full 100% completion (that left us entering after the move). A fast spring / completed
+   //  terminal sequence still fast-tracks it. Thresholds are inputs so this is calibrated to the
+   //  chart, not guessed. ---
+   bool core     = (cur_newWaveOwn>=InpEC_MinNewOwn && cur_recDepth>=InpEC_MinRecDepth);
+   bool springOK = (spring && cur_recDepth>=1);                              // failure-swing / extreme compression compresses the recursion -> fast entry
+   bool termOK   = (termDn && atFlipReal);                                   // terminal sequence completed AT a genuine S/D strike
+   bool engOK    = (cur_entryReady=="Entry Active" && cur_newWaveOwn>=InpEC_MinNewOwn);
    if( core || springOK || termOK || engOK )
       cur_ownVerdict="ENTRY_CYCLE";
    else
