@@ -3137,6 +3137,7 @@ input bool          InpUseKeyLevelStop  = true;         // Anchor SL beyond the 
 input int           InpSwingLookback    = 20;           // Bars scanned for the protective key swing high/low
 input double        InpKeyLevelBufATR   = 0.80;         // Buffer beyond the key high/low (xATR) - gold wicks are large
 input double        InpMaxSLAtr         = 10.0;         // Safety cap on total SL distance (xATR)
+input int           InpMaxSLPoints      = 600;          // HARD cap: stop-loss can NEVER be further than this many points/ticks from entry (0=off). Caps risk per trade regardless of structure/ATR.
 input bool          InpCompSizing       = true;         // Recursion-size-aware sizing: compression sets stop distance + partial timing (wide loop=wider stop, failure-swing=tighter)
 
 input group "Letra37 EA - Take Profit"
@@ -3463,6 +3464,8 @@ int OnInit()
                (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay);
    PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=NONE (ownership exits only)  trail=REMOVED  BE=REMOVED  partial=REMOVED",
                InpMinSLAtr);
+   PrintFormat("    SLCAP  : max stop distance = %s",
+               (InpMaxSLPoints>0? IntegerToString(InpMaxSLPoints)+" points":"OFF (ATR cap only)"));
    PrintFormat("    EXITS  : ownerTransfer=%s(%.0f%%)  termComplete=%s  p2Choch=%s(%d bars)  exhaustion=%s",
                (InpExitOnOwnerTransfer?"on":"off"),InpOwnerTransferThresh,
                (InpExitOnTermComplete?"on":"off"),
@@ -3697,6 +3700,12 @@ double ComputeSL(const int dir,const double entry)
    double maxD=InpMaxSLAtr*atr;
    if(dir==1  && sl<entry-maxD) sl=entry-maxD;
    if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
+   //--- HARD POINTS CAP: never further than InpMaxSLPoints from entry ---
+   if(InpMaxSLPoints>0){
+      double maxP=InpMaxSLPoints*_Point;
+      if(dir==1  && sl<entry-maxP) sl=entry-maxP;
+      if(dir==-1 && sl>entry+maxP) sl=entry+maxP;
+   }
    return(NormPrice(sl));
 }
 
@@ -3738,6 +3747,13 @@ double ComputeStructureSL(const int dir,const double entry,const bool fuEntry,co
    double maxD=InpMaxSLAtr*a;
    if(dir==1  && sl<entry-maxD) sl=entry-maxD;
    if(dir==-1 && sl>entry+maxD) sl=entry+maxD;
+   //--- HARD POINTS CAP: the stop can NEVER sit further than InpMaxSLPoints from entry
+   //  (caps per-trade risk regardless of structure/ATR; may place the stop INSIDE structure). ---
+   if(InpMaxSLPoints>0){
+      double maxP=InpMaxSLPoints*_Point;
+      if(dir==1  && sl<entry-maxP) sl=entry-maxP;
+      if(dir==-1 && sl>entry+maxP) sl=entry+maxP;
+   }
    return(NormPrice(sl));
 }
 
