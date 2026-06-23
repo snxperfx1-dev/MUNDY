@@ -3092,6 +3092,14 @@ enum ENUM_SL_MODE    { SL_ENGINE, SL_ATR, SL_FIXED };
 enum ENUM_TP_MODE    { TP_NETWORK, TP_RR, TP_ATR };   // FU/Invisible-Network attractor / RR / ATR
 enum ENUM_TRAIL_MODE { TRAIL_ATR, TRAIL_POINTS };
 enum ENUM_MIN_GRADE  { G_APLUS, G_A, G_B, G_C, G_D };
+//--- SPEC: formal entry-timing state machine (enter on the DEATH of the inverse curve, not its birth) ---
+//  BUILDING: CHoCH exists, inverse curve forming, ownership contested, recursion incomplete -> NO entry.
+//  PRE_ENTRY: recursion deep, compression mature, transfer progressing -> prepare only, NO entry.
+//  ENTRY_ACTIVE: terminal recursion complete, ownership transferred, compression exhausted -> entry allowed.
+//  CAMPAIGN_ACTIVE: holding phase (ignore noise). TERMINAL: campaign exhausted, transfer beginning again.
+enum ENUM_ENTRY_STATE { ES_BUILDING, ES_PRE_ENTRY, ES_ENTRY_ACTIVE, ES_CAMPAIGN_ACTIVE, ES_TERMINAL };
+//  SPEC: compression is NOT entry. EARLY/BUILDING = cycles remaining; only TERMINAL (exhausted) permits entry.
+enum ENUM_COMP_STATE  { CS_EARLY, CS_BUILDING, CS_TERMINAL };
 
 //==================================================================
 // EA INPUTS
@@ -3228,6 +3236,15 @@ input bool   InpFastEntryOnComp   = true;  // Allow IMMEDIATE entry in Extreme c
 input double InpMinEntryRR        = 1.5;   // Reject any entry whose target:structure-stop reward:risk is below this (kills the RR<1 expectancy bleed)
 input bool   InpStructureStop     = true;  // Place SL just BEYOND the actual structure price is reacting off (lowest flip / rung invalidation / FU tip) - not generic ATR
 
+input group "Letra37 EA - F72 Maturity Gate (timing: enter on curve DEATH, not birth)"
+input bool   InpUseMaturityGate    = true;  // SPEC: require a MATURE ownership transfer before entry (kills the premature 'birth of the inverse curve' entries that cause timing-failure losses)
+input double InpMinTransMaturity   = 70.0;  // SPEC: min transition maturity % (owner-curve dominance transfer = how complete the ownership handoff is). Tune from TRADESTAT logs.
+input double InpMinNewOwnership     = 55.0; // SPEC: min NEW-curve ownership % (the entry candidate's dominance transfer must exceed the old curve). Good=55/45, Bad=25/75.
+input bool   InpRequireTerminalComp = true; // SPEC: require compression state == TERMINAL (compression exhausted at the flip), not EARLY/BUILDING
+input int    InpMinStrikeCount      = 2;    // SPEC: min strike count = terminal CHoCH shifts inside the flip zone before entry (hypothesis: winners need >=2). Tune from logs.
+input bool   InpMaturityFastBypass  = true; // Allow an Extreme-compression / failure-swing SPRING to bypass the maturity gate (never miss the fast terminal spring)
+input bool   InpLogTradeStats       = true; // ANALYSIS: log one CSV 'TRADESTAT' line per closed trade (entry-state metrics + ResultR + MAE + MFE) so winners vs losers can be compared statistically
+
 input group "Letra37 EA - SYMPHONY Ports (ARC / Exhaustion)"
 input double InpAnchorBufATR      = 0.50;  // STOP buffer beyond the curve-origin / invalidation level (xATR). Was 0.25 - gold wicks were spiking just past structure and stopping trades out before the move ran
 input bool   InpUseARCTarget      = true;  // TP = the convex ARC apex (curved curve target) when it projects further than the flat attractor
@@ -3264,6 +3281,8 @@ datetime eaT[]; double eaO[],eaH[],eaL[],eaC[],eaVol[];
 
 //--- per-ticket management memory ---
 ulong  gMgTicket[]; double gMgInitSL[]; double gMgTP1[]; bool gMgPartialDone[]; bool gMgBEDone[]; int gMgDir[];
+//--- SPEC: per-ticket trade-stat memory (entry-time snapshot + live MAE/MFE in R, emitted on close) ---
+double gMgOpenP[]; double gMgOpenVol[]; double gMgMAE[]; double gMgMFE[]; bool gMgStatDone[]; string gMgSnap[];
 
 //==================================================================
 // HELPERS
@@ -3340,20 +3359,82 @@ void ComputeARC()
    ctx_arcDir =wd;
 }
 
+//--- SPEC: ENTRY-STATE MACHINE + OWNERSHIP + COMPRESSION STATE (derived from existing engine outputs) ---
+string EntryStateStr(const ENUM_ENTRY_STATE s)
+{
+   switch(s){ case ES_BUILDING:return("BUILDING"); case ES_PRE_ENTRY:return("PRE_ENTRY");
+              case ES_ENTRY_ACTIVE:return("ENTRY_ACTIVE"); case ES_CAMPAIGN_ACTIVE:return("CAMPAIGN_ACTIVE");
+              case ES_TERMINAL:return("TERMINAL"); }
+   return("BUILDING");
+}
+string CompStateStr(const ENUM_COMP_STATE s)
+{
+   switch(s){ case CS_EARLY:return("EARLY"); case CS_BUILDING:return("BUILDING"); case CS_TERMINAL:return("TERMINAL"); }
+   return("EARLY");
+}
+//  Map the engine's readiness/transition context onto the formal entry-state machine.
+//  ENTRY_ACTIVE only when the terminal recursion is complete OR the engine has already
+//  published "Entry Active" (a fresh Return whose dominance has transferred).
+ENUM_ENTRY_STATE CurrentEntryState()
+{
+   if(InpUseV60Context && ctx_termComplete)      return(ES_ENTRY_ACTIVE);
+   if(cur_entryReady=="Entry Active")            return(ES_ENTRY_ACTIVE);
+   if(cur_entryReady=="Pre-entry")               return(ES_PRE_ENTRY);
+   if(cur_transState=="TERMINAL")                return(ES_TERMINAL);   // terminal of the OLD curve = the entry is forming
+   return(ES_BUILDING);
+}
+//  Compression EXHAUSTION stage (spec EARLY/BUILDING/TERMINAL): only TERMINAL permits entry.
+//  EARLY = not at the flip yet; BUILDING = at the flip but shift sequence incomplete;
+//  TERMINAL = shift sequence complete OR an Extreme-compression / failure-swing spring.
+ENUM_COMP_STATE CurrentCompState()
+{
+   bool atFlip=(!InpUseV60Context) ? (cur_distFlipAtr<=1.0) : ctx_atFlip;
+   if(!atFlip) return(CS_EARLY);
+   bool exhausted=(InpUseV60Context && (ctx_termComplete || ctx_failureSwing)) || cur_compRegime=="Extreme";
+   return(exhausted ? CS_TERMINAL : CS_BUILDING);
+}
+//  SPEC ownership: new-curve % = the entry candidate's transfer (fresh Return) else the owner's transfer.
+double NewCurveOwnership(){ return(cur_mtfEntryFresh ? cur_mtfEntryDom : cur_domTransfer); }
+
 //--- management memory ---
 int MgIndex(const ulong tk){ for(int q=0;q<ArraySize(gMgTicket);q++) if(gMgTicket[q]==tk) return(q); return(-1); }
-void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir)
+//--- SPEC: emit one CSV TRADESTAT line for a CLOSED position (realized R from history + tracked MAE/MFE) ---
+void EmitTradeStat(const int q)
+{
+   if(!InpLogTradeStats || gMgStatDone[q]) return;
+   ulong posId=gMgTicket[q];
+   double riskMoney=(MathAbs(gMgOpenP[q]-gMgInitSL[q])/_Point)*MoneyPerPointPerLot()*gMgOpenVol[q];
+   double profit=0.0;
+   if(HistorySelectByPosition(posId)){
+      int nd=HistoryDealsTotal();
+      for(int d=0;d<nd;d++){
+         ulong dk=HistoryDealGetTicket(d);
+         if(dk==0) continue;
+         profit+=HistoryDealGetDouble(dk,DEAL_PROFIT)+HistoryDealGetDouble(dk,DEAL_SWAP)+HistoryDealGetDouble(dk,DEAL_COMMISSION);
+      }
+   }
+   double R=(riskMoney>0.0 ? profit/riskMoney : 0.0);
+   //  columns: see TRADESTAT_HDR printed in OnInit
+   Print("TRADESTAT,",gMgSnap[q],",",DoubleToString(R,2),",",DoubleToString(gMgMAE[q],2),",",DoubleToString(gMgMFE[q],2));
+   gMgStatDone[q]=true;
+}
+void MgRegister(const ulong tk,const double initSL,const double tp1,const int dir,
+                const double openP=0.0,const double openVol=0.0,const string snap="")
 {
    if(MgIndex(tk)>=0) return;
    int s=ArraySize(gMgTicket);
    ArrayResize(gMgTicket,s+1);ArrayResize(gMgInitSL,s+1);ArrayResize(gMgTP1,s+1);ArrayResize(gMgPartialDone,s+1);ArrayResize(gMgBEDone,s+1);ArrayResize(gMgDir,s+1);
+   ArrayResize(gMgOpenP,s+1);ArrayResize(gMgOpenVol,s+1);ArrayResize(gMgMAE,s+1);ArrayResize(gMgMFE,s+1);ArrayResize(gMgStatDone,s+1);ArrayResize(gMgSnap,s+1);
    gMgTicket[s]=tk; gMgInitSL[s]=initSL; gMgTP1[s]=tp1; gMgPartialDone[s]=false; gMgBEDone[s]=false; gMgDir[s]=dir;
+   gMgOpenP[s]=openP; gMgOpenVol[s]=openVol; gMgMAE[s]=0.0; gMgMFE[s]=0.0; gMgStatDone[s]=false; gMgSnap[s]=snap;
 }
 void MgCleanup()
 {
    for(int q=ArraySize(gMgTicket)-1;q>=0;q--){
       if(!posinfo.SelectByTicket(gMgTicket[q])){
+         EmitTradeStat(q);   // SPEC: position gone -> log its winner/loser stat line before discarding
          ArrayRemove(gMgTicket,q,1);ArrayRemove(gMgInitSL,q,1);ArrayRemove(gMgTP1,q,1);ArrayRemove(gMgPartialDone,q,1);ArrayRemove(gMgBEDone,q,1);ArrayRemove(gMgDir,q,1);
+         ArrayRemove(gMgOpenP,q,1);ArrayRemove(gMgOpenVol,q,1);ArrayRemove(gMgMAE,q,1);ArrayRemove(gMgMFE,q,1);ArrayRemove(gMgStatDone,q,1);ArrayRemove(gMgSnap,q,1);
       }
    }
 }
@@ -3433,13 +3514,16 @@ int OnInit()
 
    //--- LIVE: startup summary so the running configuration is visible in the Experts log ---
    bool _live=!MQLInfoInteger(MQL_TESTER);
-   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=live-ready",
+   PrintFormat("=== Letra37 EA init === %s  %s,%s  build=2026-06-23-maturity-gate",
                (_live?"LIVE/DEMO":"STRATEGY TESTER"),_Symbol,EnumToString(_Period));
    PrintFormat("    RISK   : mode=%s  risk=%.2f%%  maxLot=%.2f  maxTrades/day=%d  dailyLossHalt=%.1f%%",
                (InpLotMode==LOT_RISK_PCT?"RISK%":"FIXED"),InpRiskPercent,InpMaxLot,InpMaxTradesPerDay,InpMaxDailyLossPct);
    PrintFormat("    STOPS  : hardSL=ON (structure, minFloor %.1f ATR)  TP=%s  trail=%s  BE=%s  partial=%s",
                InpMinSLAtr,(InpTPMode==TP_NETWORK?"NETWORK/ARC":EnumToString(InpTPMode)),
                (InpUseTrailing?"on":"off"),(InpUseBreakeven?"on":"off"),(InpUsePartial?"on":"off"));
+   PrintFormat("    ENTRY  : maturityGate=%s  minMaturity=%.0f%%  minNewOwn=%.0f%%  termComp=%s  minStrikes=%d  fastBypass=%s",
+               (InpUseMaturityGate?"on":"off"),InpMinTransMaturity,InpMinNewOwnership,
+               (InpRequireTerminalComp?"req":"off"),InpMinStrikeCount,(InpMaturityFastBypass?"on":"off"));
    PrintFormat("    SAFETY : verifyTradeAllowed=%s  retries=%d  marginBuffer=%.0f%%  spreadGuard=%s",
                (InpVerifyTradeAllowed?"on":"off"),InpOrderRetries,InpMarginBufferPct,
                (InpMaxSpreadPoints>0?IntegerToString(InpMaxSpreadPoints)+"pts":"OFF"));
@@ -3450,6 +3534,9 @@ int OnInit()
    if(InpSmallAccount)
       PrintFormat("    SMALL-ACCT MODE ON: risk=%.2f%%  maxLot=%.2f  skipIfRisk>%.2f%%  maxTrades/day=%d",
                   InpSmallAcctRiskPct,InpSmallAcctMaxLot,InpSmallAcctMaxRiskPct,InpSmallAcctMaxTrades);
+   //--- SPEC: TRADESTAT CSV header so the per-trade winner/loser log can be parsed (grep 'TRADESTAT') ---
+   if(InpLogTradeStats)
+      Print("TRADESTAT_HDR,time,dir,src,entryState,transMaturity,newOwnership,strikeCount,chochM1,recDepth,compState,doe,readyState,distFlipATR,resultR,MAE_R,MFE_R");
 
    return(INIT_SUCCEEDED);
 }
@@ -3854,6 +3941,31 @@ void TryEnter()
       bool _cycleOK = _withCurve || _terminalEntry;
       if(!_cycleOK){ gEntryBlock="against curve / not entry-cycle (owner "+cur_curveOwner+" "+(cur_ownerDir==1?"bull":cur_ownerDir==-1?"bear":"flat")+", ready "+cur_entryReady+", shifts "+IntegerToString(_shiftsNow)+"/"+IntegerToString(InpMinTermShifts)+")"; return; }
    }
+   //--- SPEC MATURITY GATE — enter only after the ownership transfer is MATURE (curve DEATH, not birth) -----
+   //  This is the timing filter the spec asks for: distinguish BUILDING (inverse curve just born,
+   //  ownership contested, recursion incomplete) from ENTRY_ACTIVE (terminal recursion complete,
+   //  ownership transferred, compression exhausted). A fast Extreme-compression / failure-swing
+   //  spring may bypass it (InpMaturityFastBypass) so we never miss the terminal spring.
+   if(InpUseMaturityGate && !(InpMaturityFastBypass && _fast)){
+      ENUM_ENTRY_STATE _es=CurrentEntryState();
+      ENUM_COMP_STATE  _cs=CurrentCompState();
+      double _mat   =cur_transMaturity;
+      double _newOwn=NewCurveOwnership();
+      int    _strk  =(_ctxOn ? ctx_termShifts : 0);
+      bool _okState =(_es==ES_ENTRY_ACTIVE);
+      bool _okMat   =(_mat   >= InpMinTransMaturity);
+      bool _okOwn   =(_newOwn>= InpMinNewOwnership);
+      bool _okComp  =(!InpRequireTerminalComp || _cs==CS_TERMINAL);
+      bool _okStrk  =(_strk  >= InpMinStrikeCount);
+      if(!(_okState && _okMat && _okOwn && _okComp && _okStrk)){
+         gEntryBlock="immature: "+EntryStateStr(_es)
+                    +" mat "+DoubleToString(_mat,0)+"/"+DoubleToString(InpMinTransMaturity,0)
+                    +" own "+DoubleToString(_newOwn,0)+"/"+DoubleToString(InpMinNewOwnership,0)
+                    +" comp "+CompStateStr(_cs)
+                    +" strk "+IntegerToString(_strk)+"/"+IntegerToString(InpMinStrikeCount);
+         return;
+      }
+   }
    //--- SYMPHONY precise trigger: enter on the TURN (closed-bar momentum inflection at the right
    //  retrace depth, inducement complete) - the "exactly WHEN" on top of the context "WHETHER". ---
    if(!SymphonyTrigger(dir)) return;
@@ -3941,6 +4053,21 @@ void TryEnter()
    if(ok){
       gTradesToday++;
       gEntryBlock="ENTERED "+_trig;
+      //--- SPEC: snapshot the entry-time timing metrics; emitted again (with R/MAE/MFE) when the trade closes ---
+      string _statSnap="";
+      if(InpLogTradeStats){
+         _statSnap=TimeToString(TimeCurrent(),TIME_DATE|TIME_MINUTES)+","+(dir==1?"BUY":"SELL")+","+_trig
+                  +","+EntryStateStr(CurrentEntryState())
+                  +","+DoubleToString(cur_transMaturity,0)
+                  +","+DoubleToString(NewCurveOwnership(),0)
+                  +","+IntegerToString(_ctxOn?ctx_termShifts:0)
+                  +","+IntegerToString(_ctxOn?ctx_termM1Cycles:0)
+                  +","+IntegerToString(cur_recDepth)
+                  +","+CompStateStr(CurrentCompState())
+                  +","+cur_doeAction
+                  +","+cur_entryReady
+                  +","+DoubleToString(cur_distFlipAtr,1);
+      }
       //--- DEBUG: full entry reasoning so we can map where it needs improving ---
       if(InpDebugEntries){
          double _risk=MathAbs(entry-slBase); double _rr=_risk>0?MathAbs(tp-entry)/_risk:0.0;
@@ -3969,6 +4096,7 @@ void TryEnter()
          if(PositionGetInteger(POSITION_MAGIC)==(long)InpMagic && PositionGetString(POSITION_SYMBOL)==_Symbol){
             double psl=PositionGetDouble(POSITION_SL);
             double _openP=PositionGetDouble(POSITION_PRICE_OPEN);
+            double _ovol =PositionGetDouble(POSITION_VOLUME);
             double _risk =MathAbs(_openP-slBase); if(_risk<=0) _risk=(cur_atr>0?cur_atr:10*_Point);
             double _minD =MinStopDist()+_Point;
             double _tp1net=!naf(ctx_netTarget)?ctx_netTarget:ctx_attractorPx;   // FU/Network target for partial
@@ -3986,7 +4114,7 @@ void TryEnter()
                double _fb=_openP+(dir==1? _risk : -_risk);                        // 1R fallback
                _tp1net=(dir==1 ? (_fb>=_openP+_need?_fb:NA) : (_fb<=_openP-_need?_fb:NA));
             }
-            MgRegister(pt,psl,_tp1net,dir);
+            MgRegister(pt,psl,_tp1net,dir,_openP,_ovol,_statSnap);
             break;
          }
       }
@@ -4047,6 +4175,12 @@ void ManagePositions()
       double initSL=(mi>=0?gMgInitSL[mi]:curSL);
       double risk  =MathAbs(openP-initSL); if(risk<=0 || initSL<=0) risk=atr;   // unregistered/zero SL -> use ATR so BE & trailing still engage
       double rMult =(dir==1?(mkt-openP):(openP-mkt))/risk;
+
+      //--- SPEC: track MAE/MFE (in R) for the close-time TRADESTAT line ---
+      if(InpLogTradeStats && mi>=0){
+         if(rMult>gMgMFE[mi]) gMgMFE[mi]=rMult;
+         if(rMult<gMgMAE[mi]) gMgMAE[mi]=rMult;
+      }
 
       //--- bars this position has been open (gate discretionary exits) ---
       int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
