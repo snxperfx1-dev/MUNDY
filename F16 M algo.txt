@@ -3134,7 +3134,7 @@ input group "Letra37 EA - Take Profit"
 input ENUM_TP_MODE  InpTPMode           = TP_NETWORK;   // Take-profit source (FU / Invisible-Network attractor)
 input double        InpTPrr             = 2.0;          // TP = RR * risk (TP_RR)
 input double        InpTPAtrMult        = 3.0;          // TP = ATR * mult (TP_ATR)
-input bool          InpUsePartial       = true;         // Partial close at first target
+input bool          InpUsePartial       = false;        // Partial close at first target (OFF - was trimming 50% almost instantly; let the FULL position run to the ARC apex / structure SL)
 input double        InpPartialPct       = 50.0;         // Partial close % at TP1
 input bool          InpMoveBEAfterTP1   = false;        // Move SL to BE after partial (OFF - let the runner breathe to target)
 
@@ -3222,7 +3222,7 @@ input double InpArcConvPower      = 1.5;   // ARC convexity power (time-curvatur
 input bool   InpUseExhaustionExit = true;  // Composite EXIT: close on ARC-apex + wave/phase collapse + sweep-reclaim (terminal exhaustion)
 input double InpArcTolATR         = 0.20;  // How close to the ARC apex counts as "reached" (xATR)
 input bool   InpUseRiskThrottle   = true;  // DRDWCT-lite: vol-scaled risk + risk-density lot cap + block-new on open-risk breach
-input double InpRDLimit           = 0.01;  // Risk-density cap: max lots per 1.0 price-unit of stop distance (tiny-stop -> oversized-lot guard)
+input double InpRDLimit           = 3.0;   // Risk-density cap: max lots PER ATR of stop distance (only bites a sub-ATR micro-stop; normal structure stops are never clamped)
 input double InpMaxOpenRiskPct    = 6.0;   // Block NEW entries when open positions' risk-to-SL exceeds this % of equity
 
 input group "Letra37 EA - SYMPHONY Entry Trigger (precise 'when')"
@@ -3310,11 +3310,15 @@ double CalcLot(const double entry,const double sl)
    double mpp=MoneyPerPointPerLot();
    if(slPts<1 || mpp<=0) return(NormalizeLot(InpFixedLot));
    double lot=riskMoney/(slPts*mpp);
-   //--- RD "micro-bomb" cap (DRDWCT): risk density = lots / stop-distance(price). A very tight
-   //  stop must NOT create an oversized lot. Cap lots so RD <= InpRDLimit. ---
+   //--- RD "micro-bomb" cap (DRDWCT): a PATHOLOGICALLY tight stop must not create an oversized
+   //  lot (gap/slippage risk). Expressed in ATR units so it is broker-digit independent: allow
+   //  at most InpRDLimit lots PER ATR of stop distance. A normal structure stop (>=~1 ATR) is
+   //  NEVER clamped; only a sub-ATR micro-stop is. (The old price-unit form clamped normal gold
+   //  stops down to the 0.01 minimum lot - that was the "tiny lots" bug.) ---
    if(InpUseRiskThrottle && InpRDLimit>0.0){
-      double distPx=MathAbs(entry-sl);
-      if(distPx>0.0){ double rdCap=InpRDLimit*distPx; if(lot>rdCap) lot=rdCap; }
+      double atrPx =(cur_atr>0?cur_atr:10*_Point);
+      double stopAtr=MathAbs(entry-sl)/atrPx;          // stop distance measured in ATRs
+      if(stopAtr>0.0){ double rdCap=InpRDLimit*stopAtr; if(lot>rdCap) lot=rdCap; }
    }
    return(NormalizeLot(lot));
 }
@@ -4017,8 +4021,8 @@ void ManagePositions()
          }
       }
 
-      //--- partial close at TP1 ---
-      if(InpUsePartial && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
+      //--- partial close at TP1 (hold-gated: never trim a brand-new trade) ---
+      if(InpUsePartial && canSoftExit && mi>=0 && !gMgPartialDone[mi] && !naf(gMgTP1[mi])){
          bool hit=(dir==1? mkt>=gMgTP1[mi] : mkt<=gMgTP1[mi]);
          if(hit){
             double closeVol=NormalizeLot(vol*InpPartialPct/100.0);
@@ -4084,11 +4088,23 @@ void ManageExhaustionExit()
    int idx=nb-2, prv=nb-3;                 // last CLOSED bar + the one before
    double hi=eaH[idx], lo=eaL[idx], cl=eaC[idx];
    double mid=(hi+lo)*0.5;
+   sym.RefreshRates();
    for(int q=PositionsTotal()-1;q>=0;q--)
    {
       ulong tk=PositionGetTicket(q); if(tk==0) continue;
       if(PositionGetInteger(POSITION_MAGIC)!=(long)InpMagic || PositionGetString(POSITION_SYMBOL)!=_Symbol) continue;
       int dir=(PositionGetInteger(POSITION_TYPE)==POSITION_TYPE_BUY?1:-1);
+      //--- GATE: this exit BANKS A WINNER at terminal exhaustion. It must NEVER fire on a fresh
+      //  or losing trade. A terminal-reversal entry is, by design, counter to the still-printing
+      //  wave at entry, so phaseCollapse (ctx_waveDir!=dir) is true the instant we open and the
+      //  entry's own sweep+reclaim can satisfy the sweep test -> without these gates the trade
+      //  was being closed on the entry bar (the "cut as soon as it opens" bug). ---
+      int heldBars=(int)((TimeCurrent()-(datetime)PositionGetInteger(POSITION_TIME))/MathMax(PeriodSeconds(_Period),1));
+      if(heldBars<MathMax(InpMinHoldBars,1)) continue;          // give the move room first
+      double openP=PositionGetDouble(POSITION_PRICE_OPEN);
+      double px   =(dir==1?sym.Bid():sym.Ask());
+      bool   inProfit=(dir==1? px>openP : px<openP);
+      if(!inProfit) continue;                                   // only bank a move that ran our way
       //--- 1) ARC exhaustion: price reached the convex apex region ---
       bool arcHit=false;
       if(!naf(ctx_arcApex) && ctx_arcDir==dir)
