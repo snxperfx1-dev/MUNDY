@@ -3703,7 +3703,6 @@ double ComputeTP(const int dir,const double entry,const double sl)
    //--- SPEC AUDIT: ALL take-profit targets removed. Campaigns complete on ownership transfer /
    //  terminal-sequence completion / P2 CHOCH — not on an arbitrary RR or price level.
    //  Return 0 = no broker-side TP (the position lives until the engine closes it or SL hits). ---
-   (void)dir; (void)entry; (void)sl;
    return(0.0);
 }
 
